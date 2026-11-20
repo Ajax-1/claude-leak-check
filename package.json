@@ -1,0 +1,55 @@
+{
+  "name": "claude-leak-check",
+  "version": "0.1.0",
+  "description": "Local read-only IP leak, split-routing, and firewall diagnostic tool for Claude Desktop and Claude Code.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "ip-leak",
+    "dns-leak",
+    "webrtc",
+    "tun",
+    "lulu",
+    "clash",
+    "mihomo",
+    "security-audit",
+    "agent-skill"
+  ],
+  "homepage": "https://github.com/Ajax-1/claude-leak-check#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ajax-1/claude-leak-check.git"
+  },
+  "license": "MIT",
+  "author": "Ajax-1 <85230126+Ajax-1@users.noreply.github.com>",
+  "type": "module",
+  "bin": {
+    "claude-leak-check": "./dist/cli.js",
+    "cc-leak-check": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "SKILL.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/postbuild.mjs",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test dist-test/tests/*.test.js",
+    "start": "node ./dist/cli.js",
+    "demo:safe": "node ./dist/cli.js --demo safe",
+    "demo:leak": "node ./dist/cli.js --demo leak",
+    "prepublishOnly": "npm test"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}
