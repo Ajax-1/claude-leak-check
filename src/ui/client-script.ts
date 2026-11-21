@@ -80,6 +80,8 @@ export const CLIENT_SCRIPT = String.raw`
       fwLocked: "防火墙已焊死 ✓",
       fwUnlocked: "未锁定 / 可直连",
       npmDanger: "npm node 进程盲区 ✕",
+      shimWarn: "垫片待核验 !",
+      stubWarn: "未完成安装 (桩文件)",
       modalTitle: "导出脱敏体检卡",
       modalSub: "真实 IP、系统用户名与节点信息已在画布层自动打码（如 198.51.*.*），可直接截图或保存图片分享。",
       ratio169: "16:9 横版",
@@ -159,6 +161,8 @@ export const CLIENT_SCRIPT = String.raw`
       fwLocked: "Firewall Locked ✓",
       fwUnlocked: "Unprotected",
       npmDanger: "npm 'node' Blindspot ✕",
+      shimWarn: "Unverified Shim !",
+      stubWarn: "Incomplete Stub",
       modalTitle: "Export Redacted Diagnostic Card",
       modalSub: "Real IPs, usernames, and node names are strictly masked on canvas (e.g. 198.51.*.*), ready for X, Reddit, or Discord.",
       ratio169: "16:9 Landscape (X / GitHub)",
@@ -570,9 +574,13 @@ export const CLIENT_SCRIPT = String.raw`
               var badge =
                 b.kind === "global-cli-npm-node"
                   ? '<span class="status-badge st-crit">' + esc(t("npmDanger")) + "</span>"
-                  : b.firewallCovered
-                    ? '<span class="status-badge st-pass">' + esc(t("fwLocked")) + "</span>"
-                    : '<span class="status-badge st-warn">' + esc(t("fwUnlocked")) + "</span>";
+                  : b.kind === "global-cli-stub"
+                    ? '<span class="status-badge st-warn">' + esc(t("stubWarn")) + "</span>"
+                    : b.kind === "global-cli-unverified-shim"
+                      ? '<span class="status-badge st-warn">' + esc(t("shimWarn")) + "</span>"
+                      : b.firewallCovered
+                        ? '<span class="status-badge st-pass">' + esc(t("fwLocked")) + "</span>"
+                        : '<span class="status-badge st-warn">' + esc(t("fwUnlocked")) + "</span>";
               return (
                 '<div class="bin-row">' +
                   '<div style="flex:1;min-width:240px">' +

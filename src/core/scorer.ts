@@ -510,7 +510,7 @@ export function evaluateAuditScores(input: ScoringInputs): ScoringOutput {
   const m4Findings: CheckFinding[] = [];
   let m4Deduct = 0;
 
-  // 4.1 高危 npm node 版全局 CLI
+  // 4.1 全局 CLI 三态审计（Node 脚本驻留风险 / 未核验版本管理器垫片 / 未完成 postinstall 桩文件）
   const npmCli = input.binaries.find((b) => b.kind === "global-cli-npm-node");
   if (npmCli) {
     m4Deduct += 10;
@@ -525,12 +525,59 @@ export function evaluateAuditScores(input: ScoringInputs): ScoringOutput {
         en: `Detected Node.js-interpreted global 'claude' script (${npmCli.displayPath})`,
       },
       detail: {
-        zh: "该入口实际驻留进程为 `node`（常见于旧版纯 JS 包或未完成原生二进制替换的 fallback 脚本），LuLu / Little Snitch 等防火墙无法通过 Anthropic 签名将其与普通前端 Node 进程区分开。",
-        en: "This entrypoint executes inside the generic `node` runtime rather than Anthropic's signed native binary, preventing signature-based firewall isolation.",
+        zh: "该入口实际驻留进程为 'node'（常见于旧版纯 JS 包或未完成原生二进制替换的 fallback 脚本），LuLu / Little Snitch 等防火墙无法通过 Anthropic 签名将其与普通前端 Node 进程区分开。",
+        en: "This entrypoint executes inside the generic 'node' runtime rather than Anthropic's signed native binary, preventing signature-based firewall isolation.",
       },
       remediation: {
-        zh: "建议升级至包含原生 Mach-O 二进制的新版 `@anthropic-ai/claude-code`（确保未开启 `--ignore-scripts` / `--omit=optional`），或改用官方独立安装器。",
-        en: "Upgrade to a modern native-binary release (without `--ignore-scripts` / `--omit=optional`) or use Anthropic's standalone installer.",
+        zh: "建议升级至包含原生 Mach-O 二进制的新版 @anthropic-ai/claude-code（确保未开启 --ignore-scripts / --omit=optional），或改用官方独立安装器。",
+        en: "Upgrade to a modern native-binary release (without --ignore-scripts / --omit=optional) or use Anthropic's standalone installer.",
+      },
+    });
+  }
+
+  const unverifiedShim = input.binaries.find((b) => b.kind === "global-cli-unverified-shim");
+  if (unverifiedShim) {
+    m4Deduct += 4;
+    m4Findings.push({
+      id: "cli-unverified-shim",
+      moduleId: "app_footprint",
+      severity: "warn",
+      pointsDeducted: 4,
+      triggersRedline: false,
+      title: {
+        zh: `全局 claude 为版本管理器垫片或非 Anthropic 签名程序 (${unverifiedShim.displayPath})`,
+        en: `Global 'claude' is a version-manager shim or non-Anthropic binary (${unverifiedShim.displayPath})`,
+      },
+      detail: {
+        zh: "该入口并非带 Anthropic 官方签名的原生 Mach-O（典型如 Volta shim、asdf 或 mise 动态垫片），纯静态检查无法确认其底层最终拉起的是官方签名二进制还是 Node 脚本。",
+        en: "This entrypoint is a dynamic shim (e.g. Volta / asdf / mise) or non-Anthropic binary, so static inspection cannot verify its underlying runtime signature.",
+      },
+      remediation: {
+        zh: "建议核实垫片实际转发的底层二进制是否带有 com.anthropic.claude-code (Q6L2SF6YDW) 签名，并在防火墙中按签名或实际落地路径锁定。",
+        en: "Verify that the underlying binary invoked by your version manager is signed with com.anthropic.claude-code (Q6L2SF6YDW) and locked in your firewall.",
+      },
+    });
+  }
+
+  const stubCli = input.binaries.find((b) => b.kind === "global-cli-stub");
+  if (stubCli) {
+    m4Findings.push({
+      id: "cli-uninstalled-stub",
+      moduleId: "app_footprint",
+      severity: "info",
+      pointsDeducted: 0,
+      triggersRedline: false,
+      title: {
+        zh: `检测到未完成 postinstall 的全局 claude 占位桩文件 (${stubCli.displayPath})`,
+        en: `Detected incomplete postinstall stub for global 'claude' (${stubCli.displayPath})`,
+      },
+      detail: {
+        zh: "该文件为包管理器跳过 postinstall（如 pnpm v10 默认拦截构建脚本或使用了 --ignore-scripts）留下的报错脚本，运行时直接退出，不会发起网络请求。",
+        en: "Placeholder error script left when postinstall was skipped (e.g. pnpm v10 build policy or --ignore-scripts); exits immediately without network activity.",
+      },
+      remediation: {
+        zh: "如需使用该全局命令，请执行 pnpm approve-builds -g 允许构建脚本拉取原生二进制，或卸载该残缺全局包。",
+        en: "Run 'pnpm approve-builds -g' / reinstall without '--ignore-scripts', or remove the unused broken stub.",
       },
     });
   }
@@ -652,9 +699,12 @@ export function evaluateAuditScores(input: ScoringInputs): ScoringOutput {
     }
   }
 
-  // 4.5 防火墙焊死度检查
-  const installedCount = input.binaries.length;
-  const unprotectedBins = input.binaries.filter((b) => !b.firewallCovered);
+  // 4.5 防火墙焊死度检查（排除无法联网的未安装占位桩文件与已单独告警的动态垫片）
+  const actionableBins = input.binaries.filter(
+    (b) => b.kind !== "global-cli-stub" && b.kind !== "global-cli-unverified-shim"
+  );
+  const installedCount = actionableBins.length;
+  const unprotectedBins = actionableBins.filter((b) => !b.firewallCovered);
   if (installedCount > 0 && unprotectedBins.length > 0 && !input.firewallAudit.littleSnitchDetected) {
     const pts = Math.min(10, input.firewallAudit.bootRaceRisk ? 10 : 7);
     m4Deduct += pts;

@@ -6,7 +6,7 @@ import test from "node:test";
 import { DOMAIN_MATRIX } from "../src/core/domains.js";
 import { runFullAudit } from "../src/core/engine.js";
 import { evaluateAuditScores } from "../src/core/scorer.js";
-import { inspectCliBinaryKind } from "../src/platforms/darwin.js";
+import { inspectCliBinaryKind, verifyAnthropicCodesignOutput } from "../src/platforms/darwin.js";
 import {
   extractLaunchDaemonLabelAndScripts,
   hasMacosPfDeadlockPattern,
@@ -14,7 +14,7 @@ import {
   parseLuluRules,
 } from "../src/platforms/lulu-parser.js";
 
-test("inspectCliBinaryKind distinguishes modern npm/pnpm native Mach-O wrappers (2.1.330+) from true Node.js scripts", () => {
+test("inspectCliBinaryKind & verifyAnthropicCodesignOutput accurately handle 4 CLI states and codesign stderr", () => {
   const dir = mkdtempSync(join(tmpdir(), "cc-bin-test-"));
   try {
     // 构造模拟的 Mach-O 64-bit arm64 原生二进制头 (0xcffaedfe)
@@ -32,6 +32,7 @@ test("inspectCliBinaryKind distinguishes modern npm/pnpm native Mach-O wrappers 
     symlinkSync("../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe", npmLink);
 
     const npmInspected = inspectCliBinaryKind(npmLink);
+    assert.equal(npmInspected.classification, "native-macho");
     assert.equal(npmInspected.isMachO, true);
     assert.equal(npmInspected.isNodeScript, false);
 
@@ -43,6 +44,7 @@ test("inspectCliBinaryKind distinguishes modern npm/pnpm native Mach-O wrappers 
       "utf8"
     );
     const pnpmInspected = inspectCliBinaryKind(pnpmShim);
+    assert.equal(pnpmInspected.classification, "native-macho");
     assert.equal(pnpmInspected.isMachO, true);
     assert.equal(pnpmInspected.isNodeScript, false);
     assert.equal(pnpmInspected.viaShellExecWrapper, true);
@@ -55,6 +57,7 @@ test("inspectCliBinaryKind distinguishes modern npm/pnpm native Mach-O wrappers 
     symlinkSync("../lib/node_modules/@anthropic-ai/claude-code/bin/cli.js", legacyLink);
 
     const legacyInspected = inspectCliBinaryKind(legacyLink);
+    assert.equal(legacyInspected.classification, "node-script");
     assert.equal(legacyInspected.isNodeScript, true);
     assert.equal(legacyInspected.isMachO, false);
 
@@ -66,11 +69,92 @@ test("inspectCliBinaryKind distinguishes modern npm/pnpm native Mach-O wrappers 
       "utf8"
     );
     const nodeShimInspected = inspectCliBinaryKind(nodeShim);
+    assert.equal(nodeShimInspected.classification, "node-script");
     assert.equal(nodeShimInspected.isNodeScript, true);
     assert.equal(nodeShimInspected.isMachO, false);
+
+    // 5. pnpm v10 拦截 postinstall 或 --ignore-scripts 残留的 9 行无 #! 报错桩文件（含直接软链与 pnpm 包装器两层场景）
+    const stubExe = join(pkgBinDir, "claude-stub.exe");
+    writeFileSync(
+      stubExe,
+      [
+        'echo "Error: claude native binary not installed." >&2',
+        'echo "Your package manager may have blocked lifecycle scripts during install." >&2',
+        "exit 1",
+      ].join("\n"),
+      "utf8"
+    );
+    const stubDirect = inspectCliBinaryKind(stubExe);
+    assert.equal(stubDirect.classification, "uninstalled-stub");
+    assert.equal(stubDirect.isMachO, false);
+    assert.equal(stubDirect.isNodeScript, false);
+
+    const pnpmStubWrapper = join(dir, "pnpm-stub-claude");
+    writeFileSync(
+      pnpmStubWrapper,
+      `#!/bin/sh\nbasedir=$(dirname "$0")\nexec "$basedir/lib/node_modules/@anthropic-ai/claude-code/bin/claude-stub.exe" "$@"\n`,
+      "utf8"
+    );
+    const stubWrapped = inspectCliBinaryKind(pnpmStubWrapper);
+    assert.equal(stubWrapped.classification, "uninstalled-stub");
+    assert.equal(stubWrapped.viaShellExecWrapper, true);
+
+    // 6. asdf / mise 动态垫片脚本（无法静态确认最终落点签名，绝不能误判为原生签名 Mach-O）
+    const asdfShim = join(dir, "asdf-claude");
+    writeFileSync(
+      asdfShim,
+      `#!/usr/bin/env bash\n# asdf-plugin: nodejs\nexec /opt/homebrew/opt/asdf/libexec/bin/asdf exec "claude" "$@"\n`,
+      "utf8"
+    );
+    const asdfInspected = inspectCliBinaryKind(asdfShim);
+    assert.equal(asdfInspected.classification, "unknown-shim");
+    assert.equal(asdfInspected.isMachO, false);
+    assert.equal(asdfInspected.isNodeScript, false);
+
+    const miseShim = join(dir, "mise-claude");
+    writeFileSync(
+      miseShim,
+      `#!/bin/sh\nexport MISE_DATA_DIR="$HOME/.local/share/mise"\nexec "/opt/homebrew/bin/mise" x -- claude "$@"\n`,
+      "utf8"
+    );
+    const miseInspected = inspectCliBinaryKind(miseShim);
+    assert.equal(miseInspected.classification, "unknown-shim");
+    assert.equal(miseInspected.isMachO, false);
+    assert.equal(miseInspected.isNodeScript, false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+
+  // 7. codesign -dv stderr 输出校验（区分 Anthropic 官方签名 vs Volta 二进制垫片 vs 空输出/未签名）
+  const anthropicCliStderr = [
+    "Executable=/Users/demo/.local/share/claude/versions/2.1.330",
+    "Identifier=com.anthropic.claude-code",
+    "Format=Mach-O thin (arm64)",
+    "CodeDirectory v=20500 size=123456 flags=0x10000(runtime) hashes=3850+7 location=embedded",
+    "Signature size=9051",
+    "Timestamp=20 Nov 2026 at 10:00:00",
+    "TeamIdentifier=Q6L2SF6YDW",
+  ].join("\n");
+  const verifiedCli = verifyAnthropicCodesignOutput(anthropicCliStderr);
+  assert.equal(verifiedCli.signedByAnthropic, true);
+  assert.equal(verifiedCli.teamId, "Q6L2SF6YDW");
+  assert.equal(verifiedCli.identifier, "com.anthropic.claude-code");
+
+  const voltaShimStderr = [
+    "Executable=/Users/demo/.volta/bin/volta-shim",
+    "Identifier=volta-shim-55554944ab12cd34",
+    "Format=Mach-O thin (arm64)",
+    "Signature=adhoc",
+    "TeamIdentifier=not set",
+  ].join("\n");
+  const verifiedVolta = verifyAnthropicCodesignOutput(voltaShimStderr);
+  assert.equal(verifiedVolta.signedByAnthropic, false);
+
+  assert.equal(verifyAnthropicCodesignOutput("").signedByAnthropic, false);
+  assert.equal(
+    verifyAnthropicCodesignOutput("/tmp/fake: code object is not signed at all").signedByAnthropic,
+    false
+  );
 });
 
 test("DOMAIN_MATRIX contains 27 targets including assets-proxy and bridge subdomains", () => {
@@ -389,4 +473,95 @@ test("Scoring engine awards A+ on safe baseline and caps at <=45 (F) on fatal re
   assert.ok(leakRes.report.finalScore <= 45);
   assert.equal(leakRes.report.grade, "F");
   assert.ok(leakRes.report.redlineReasons.length >= 3);
+});
+
+test("Scorer handles global-cli-stub (info, 0 pts) and global-cli-unverified-shim (warn, -4 pts) without misreporting", async () => {
+  const { report } = await runFullAudit({ demo: "safe" });
+  const baseNet = {
+    activeUtunInterfaces: ["utun5"],
+    defaultRouteInterface: "utun5",
+    dnsServers: ["198.18.0.2"],
+    dnsServersMasked: ["198.18.*.* (Fake-IP)"],
+    tailscaleMagicDns: false,
+    icloudPrivateRelaySuspected: false,
+    competingVpns: [],
+    systemProxy: { httpEnabled: false, httpsEnabled: false, socksEnabled: false },
+    publicIpv6Interfaces: [],
+  };
+  const baseEnv = {
+    systemTimezone: "Asia/Taipei",
+    isMainlandTimezone: false,
+    systemLocale: "en_US.UTF-8",
+    defaultBrowser: "Brave Browser",
+    hasAnthropicBaseUrl: false,
+    anthropicBaseUrlIsCustomThirdParty: false,
+    settingsHasCustomBaseUrl: false,
+    proxyEnvVarsPresent: [],
+    proxyEnvConflictsWithSystem: false,
+    dedicatedLoopbackProxyPorts: [],
+    deadLoopbackProxyPorts: [],
+    riskyReverseProxies: [],
+    mcpServerCount: 0,
+    mcpCommands: [],
+    suspiciousSettingsEnvKeys: [],
+  };
+
+  // 1. 存在未完成 postinstall 的占位桩文件时：给 info 提示（0 分），且不连坐破坏已锁定的真实二进制
+  const withStub = evaluateAuditScores({
+    netSnap: baseNet,
+    primaryExit: report.primaryExit,
+    domainMatrix: report.domainMatrix,
+    binaries: [
+      ...report.binaries,
+      {
+        id: "global-stub-test",
+        name: "全局终端 claude (未完成 postinstall 占位脚本)",
+        displayPath: "~/Library/pnpm/claude",
+        kind: "global-cli-stub",
+        exists: true,
+        signedByAnthropic: false,
+        firewallCovered: false,
+        riskLevel: "warn",
+        note: { zh: "stub", en: "stub" },
+      },
+    ],
+    proxyAudit: report.proxyAudit,
+    firewallAudit: report.firewallAudit,
+    envSnap: baseEnv,
+    browserSync: report.browserSync,
+    killSwitchDrill: report.killSwitchDrill,
+  });
+  assert.equal(withStub.finalScore, 100);
+  const stubM4 = withStub.modules.find((m) => m.id === "app_footprint")!;
+  assert.ok(stubM4.findings.some((f) => f.id === "cli-uninstalled-stub" && f.pointsDeducted === 0));
+  assert.ok(stubM4.findings.some((f) => f.id === "firewall-all-locked"));
+
+  // 2. 存在 Volta / asdf / mise 等未核验垫片时：给 warn 提示（轻扣 4 分），绝不谎报已确认为官方签名 Mach-O
+  const withShim = evaluateAuditScores({
+    netSnap: baseNet,
+    primaryExit: report.primaryExit,
+    domainMatrix: report.domainMatrix,
+    binaries: [
+      ...report.binaries,
+      {
+        id: "global-shim-test",
+        name: "全局终端 claude (版本管理器二进制垫片 / 非官方签名)",
+        displayPath: "~/.volta/bin/claude",
+        kind: "global-cli-unverified-shim",
+        exists: true,
+        signedByAnthropic: false,
+        firewallCovered: false,
+        riskLevel: "warn",
+        note: { zh: "shim", en: "shim" },
+      },
+    ],
+    proxyAudit: report.proxyAudit,
+    firewallAudit: { ...report.firewallAudit, claudeCliLocked: false },
+    envSnap: baseEnv,
+    browserSync: report.browserSync,
+    killSwitchDrill: report.killSwitchDrill,
+  });
+  assert.equal(withShim.finalScore, 96);
+  const shimM4 = withShim.modules.find((m) => m.id === "app_footprint")!;
+  assert.ok(shimM4.findings.some((f) => f.id === "cli-unverified-shim" && f.pointsDeducted === 4));
 });

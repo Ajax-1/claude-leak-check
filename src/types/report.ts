@@ -72,6 +72,8 @@ export interface ClaudeBinaryItem {
     | "desktop-bundled-cli"
     | "global-cli-native"
     | "global-cli-npm-node"
+    | "global-cli-unverified-shim"
+    | "global-cli-stub"
     | "ide-extension-cli";
   exists: boolean;
   signedByAnthropic: boolean;

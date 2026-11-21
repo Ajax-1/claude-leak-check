@@ -168,7 +168,14 @@ export function formatMarkdownReport(report: AuditReport, lang: "zh" | "en" = "z
     lines.push(lang === "zh" ? "- 未在标准路径检测到本地安装组件。" : "- No standard local installations found.");
   } else {
     for (const b of report.binaries) {
-      const lockTag = b.firewallCovered ? "[LOCKED]" : "[OPEN]";
+      const lockTag =
+        b.kind === "global-cli-stub"
+          ? "[STUB]"
+          : b.kind === "global-cli-unverified-shim"
+            ? "[UNVERIFIED-SHIM]"
+            : b.firewallCovered
+              ? "[LOCKED]"
+              : "[OPEN]";
       lines.push(`- \`${lockTag}\` **${b.name}** (\`${b.displayPath}\`) — ${pick(b.note)}`);
     }
   }

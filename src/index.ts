@@ -17,6 +17,8 @@ export {
   classifyAsnOrg,
   extractListeningLoopbackPortsMac,
   inspectCliBinaryKind,
+  verifyAnthropicCodesignOutput,
+  type CliBinaryClassification,
   type CliBinaryInspection,
 } from "./platforms/darwin.js";
 export {

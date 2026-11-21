@@ -64,6 +64,48 @@ async function runCmd(cmd: string, args: string[], timeoutMs = 2500): Promise<st
   }
 }
 
+/**
+ * 合并读取 stdout 与 stderr（macOS 的 `/usr/bin/codesign -dv` 全部签名元数据均输出在 stderr）
+ */
+async function runCmdCombined(cmd: string, args: string[], timeoutMs = 2500): Promise<string> {
+  try {
+    const { stdout, stderr } = await execFileAsync(cmd, args, {
+      timeout: timeoutMs,
+      maxBuffer: 4 * 1024 * 1024,
+      env: { ...process.env, LC_ALL: "C" },
+    });
+    return `${stdout || ""}\n${stderr || ""}`.trim();
+  } catch (err) {
+    if (err && typeof err === "object") {
+      const rec = err as { stdout?: unknown; stderr?: unknown };
+      const out = typeof rec.stdout === "string" ? rec.stdout : "";
+      const errOut = typeof rec.stderr === "string" ? rec.stderr : "";
+      return `${out}\n${errOut}`.trim();
+    }
+    return "";
+  }
+}
+
+export function verifyAnthropicCodesignOutput(codesignCombinedOutput: string): {
+  signedByAnthropic: boolean;
+  identifier?: string;
+  teamId?: string;
+} {
+  if (!codesignCombinedOutput || /not signed at all/i.test(codesignCombinedOutput)) {
+    return { signedByAnthropic: false };
+  }
+  const idMatch = /^Identifier=(\S+)/m.exec(codesignCombinedOutput);
+  const teamMatch = /^TeamIdentifier=(\S+)/m.exec(codesignCombinedOutput);
+  const identifier = idMatch?.[1];
+  const teamId = teamMatch?.[1];
+
+  const signedByAnthropic =
+    teamId === "Q6L2SF6YDW" ||
+    Boolean(identifier && /^com\.anthropic\.claude(?:-code|fordesktop)?(?:\.|$)/i.test(identifier));
+
+  return { signedByAnthropic, identifier, teamId };
+}
+
 async function runCurlProbe(
   args: string[],
   timeoutSec = 3.2
@@ -712,6 +754,9 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
       "/usr/local/bin/claude",
       join(home, ".bun/bin/claude"),
       join(home, "Library/pnpm/claude"),
+      join(home, ".volta/bin/claude"),
+      join(home, ".asdf/shims/claude"),
+      join(home, ".local/share/mise/shims/claude"),
     ]) {
       if (existsSync(extra)) globalCandidates.add(extra);
     }
@@ -720,11 +765,12 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
     for (const cliPath of globalCandidates) {
       if (!existsSync(cliPath)) continue;
       const binType = inspectCliBinaryKind(cliPath);
-      const dedupeKey = binType.resolvedBinaryPath || cliPath;
+      const dedupeKey = `${binType.classification}:${binType.resolvedBinaryPath || cliPath}`;
       if (seenResolvedCliTargets.has(dedupeKey)) continue;
       seenResolvedCliTargets.add(dedupeKey);
 
-      if (binType.isNodeScript) {
+      if (binType.classification === "node-script") {
+        // 分支 A：确认为驻留 node / bun / deno 解释器的 JS 脚本
         binaries.push({
           id: `global-npm-${cliPath}`,
           name: "全局终端 claude (Node.js 脚本运行时)",
@@ -739,33 +785,88 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
             en: "Runs inside the 'node' runtime (legacy JS build or fallback wrapper), preventing per-app firewall isolation without blocking all Node dev tools.",
           },
         });
-      } else {
-        const signCheckTarget = binType.resolvedBinaryPath || cliPath;
-        const codesignOut = await runCmd("/usr/bin/codesign", ["-dv", signCheckTarget], 1500);
-        const signed = /anthropic|Q6L2SF6YDW/i.test(codesignOut) || binType.isMachO;
-        const viaPkgManager = /node_modules|pnpm/i.test(signCheckTarget) || binType.viaShellExecWrapper;
-        const covered = luluActive && luluSummary.coversAnthropicSigningId;
+      } else if (binType.classification === "uninstalled-stub") {
+        // 分支 C1：pnpm v10 默认拦截 postinstall 或 --ignore-scripts 留下的报错占位桩文件
         binaries.push({
-          id: `global-native-${cliPath}`,
-          name: viaPkgManager
-            ? "全局终端 claude (npm/pnpm 分发原生二进制)"
-            : "全局终端 claude (官方原生二进制)",
+          id: `global-stub-${cliPath}`,
+          name: "全局终端 claude (未完成 postinstall 占位脚本)",
           displayPath: sanitizePath(cliPath),
-          kind: "global-cli-native",
+          kind: "global-cli-stub",
           exists: true,
-          signedByAnthropic: signed,
-          bundleOrSigningId: "com.anthropic.claude-code",
-          firewallCovered: covered,
-          riskLevel: covered ? "pass" : "warn",
-          note: covered
-            ? {
-                zh: "最终执行文件为带官方签名的原生 Mach-O 二进制，已受防火墙代码签名规则锁定",
-                en: "Executes Anthropic-signed native Mach-O binary covered by firewall signing rule",
-              }
-            : {
-                zh: "最终执行文件为带 Anthropic 签名的原生 Mach-O 二进制（无 node 驻留），可在防火墙中按签名 com.anthropic.claude-code 单独锁定",
-                en: "Executes Anthropic-signed native Mach-O binary (no Node runtime); lock via signing ID com.anthropic.claude-code in firewall",
-              },
+          signedByAnthropic: false,
+          firewallCovered: false,
+          riskLevel: "warn",
+          note: {
+            zh: "检测到 `claude native binary not installed` 报错桩文件（常见于 pnpm v10 拦截 postinstall 或使用了 --ignore-scripts / --omit=optional），当前无法运行，需执行 postinstall 拉取原生二进制。",
+            en: "Placeholder stub ('claude native binary not installed'); postinstall was skipped (e.g. pnpm v10 build policy or --ignore-scripts).",
+          },
+        });
+      } else if (binType.classification === "native-macho") {
+        // 读取 codesign -dv 合并输出 (stderr) 严格验证是否确实携带 Anthropic 官方签名（排除 volta-shim 等第三方二进制垫片！）
+        const signCheckTarget = binType.resolvedBinaryPath || cliPath;
+        const codesignOut = await runCmdCombined("/usr/bin/codesign", ["-dv", signCheckTarget], 1500);
+        const signVerify = verifyAnthropicCodesignOutput(codesignOut);
+
+        if (signVerify.signedByAnthropic) {
+          // 分支 B：确认为带 Anthropic 官方签名的原生 Mach-O 二进制
+          const viaPkgManager = /node_modules|pnpm/i.test(signCheckTarget) || binType.viaShellExecWrapper;
+          const covered = luluActive && luluSummary.coversAnthropicSigningId;
+          binaries.push({
+            id: `global-native-${cliPath}`,
+            name: viaPkgManager
+              ? "全局终端 claude (npm/pnpm 分发原生二进制)"
+              : "全局终端 claude (官方原生二进制)",
+            displayPath: sanitizePath(cliPath),
+            kind: "global-cli-native",
+            exists: true,
+            signedByAnthropic: true,
+            teamId: signVerify.teamId,
+            bundleOrSigningId: signVerify.identifier || "com.anthropic.claude-code",
+            firewallCovered: covered,
+            riskLevel: covered ? "pass" : "warn",
+            note: covered
+              ? {
+                  zh: "已通过 codesign 确认为 Anthropic 官方签名 Mach-O 二进制，且已受防火墙签名规则锁定",
+                  en: "Verified Anthropic-signed Mach-O binary covered by firewall signing rule",
+                }
+              : {
+                  zh: "已通过 codesign 确认为 Anthropic 官方签名 Mach-O 二进制（无 node 驻留），可在防火墙中按签名 com.anthropic.claude-code 单独锁定",
+                  en: "Verified Anthropic-signed Mach-O binary (no Node runtime); lock via signing ID com.anthropic.claude-code in firewall",
+                },
+          });
+        } else {
+          // 分支 C2：虽然是 Mach-O 二进制，但并非 Anthropic 签名（典型如 ~/.volta/bin/claude 指向的 volta-shim）
+          binaries.push({
+            id: `global-shim-macho-${cliPath}`,
+            name: "全局终端 claude (版本管理器二进制垫片 / 非官方签名)",
+            displayPath: sanitizePath(cliPath),
+            kind: "global-cli-unverified-shim",
+            exists: true,
+            signedByAnthropic: false,
+            bundleOrSigningId: signVerify.identifier,
+            firewallCovered: false,
+            riskLevel: "warn",
+            note: {
+              zh: `该入口为非 Anthropic 签名的二进制垫片（如 Volta shim${signVerify.identifier ? `: ${signVerify.identifier}` : ""}），无法静态确认其转发的目标程序是原生签名版还是旧版 node 脚本，请核实底层实际工具链路径与签名。`,
+              en: "Non-Anthropic binary shim (e.g. Volta shim); cannot statically confirm whether the delegated binary is native-signed or Node-based.",
+            },
+          });
+        }
+      } else {
+        // 分支 C3：asdf / mise 等动态 Shell 垫片或无法静态追踪 exec 落点的包装脚本
+        binaries.push({
+          id: `global-shim-script-${cliPath}`,
+          name: "全局终端 claude (动态环境垫片脚本 / 待核验)",
+          displayPath: sanitizePath(cliPath),
+          kind: "global-cli-unverified-shim",
+          exists: true,
+          signedByAnthropic: false,
+          firewallCovered: false,
+          riskLevel: "warn",
+          note: {
+            zh: "该入口为动态版本管理器垫片（如 asdf / mise shim）或自定义脚本，无法静态解析最终二进制签名，请执行 `claude --version` 并核实实际落地文件是否携带 com.anthropic.claude-code 签名。",
+            en: "Dynamic version-manager shim (e.g. asdf / mise); cannot statically resolve underlying binary code signature.",
+          },
         });
       }
     }
@@ -830,12 +931,15 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
         b.kind === "desktop-bundled-cli" ||
         b.kind === "global-cli-native" ||
         b.kind === "global-cli-npm-node" ||
+        b.kind === "global-cli-unverified-shim" ||
         b.kind === "ide-extension-cli"
     );
     const claudeCliLocked =
       installedCliBins.length > 0
         ? installedCliBins.every((b) => b.firewallCovered) &&
-          !installedCliBins.some((b) => b.kind === "global-cli-npm-node")
+          !installedCliBins.some(
+            (b) => b.kind === "global-cli-npm-node" || b.kind === "global-cli-unverified-shim"
+          )
         : claudeAppFullyLocked;
 
     return {
@@ -1140,7 +1244,14 @@ function extractPortFromProxyEnv(proxyUrl?: string): number | undefined {
   }
 }
 
+export type CliBinaryClassification =
+  | "node-script"
+  | "native-macho"
+  | "uninstalled-stub"
+  | "unknown-shim";
+
 export interface CliBinaryInspection {
+  classification: CliBinaryClassification;
   isNodeScript: boolean;
   isMachO: boolean;
   viaShellExecWrapper: boolean;
@@ -1167,15 +1278,20 @@ function hasMachOMagic(filePath: string): boolean {
 }
 
 /**
- * 追踪软链接与包管理器（pnpm / yarn / fnm）生成的 POSIX Shell `exec` 启动脚本，
- * 准确区分「最终直接 exec 原生 Mach-O 签名二进制（新版 2.1.x npm/pnpm 分发包）」与「真正驻留 node 解释器的 JS 脚本」
+ * 追踪软链接与包管理器（pnpm / yarn / fnm / volta / asdf / mise）生成的启动入口，
+ * 严谨区分四类落点：
+ * - `native-macho`：最终指向原生 Mach-O 二进制（后续再交由 `codesign -dv` stderr 校验是否为 Anthropic 签名）
+ * - `node-script`：最终驻留 `node` / `bun` / `deno` 解释器运行 JS 脚本
+ * - `uninstalled-stub`：`@anthropic-ai/claude-code` 因跳过 `postinstall` 留下的报错占位桩文件
+ * - `unknown-shim`：`asdf` / `mise` 等动态环境垫片或无法静态确认落点的自定义脚本
  */
 export function inspectCliBinaryKind(filePath: string, depth = 0): CliBinaryInspection {
   if (depth > 4) {
     return {
+      classification: "unknown-shim",
       isNodeScript: false,
       isMachO: false,
-      viaShellExecWrapper: false,
+      viaShellExecWrapper: depth > 0,
       resolvedBinaryPath: filePath,
     };
   }
@@ -1193,9 +1309,10 @@ export function inspectCliBinaryKind(filePath: string, depth = 0): CliBinaryInsp
   }
 
   try {
-    // 1. 先直接读取文件头判断是否为原生 Mach-O 可执行文件（新版 @anthropic-ai/claude-code postinstall 会把原生二进制写入 bin/claude.exe）
+    // 1. 先直接读取文件头判断是否为原生 Mach-O 可执行文件（含官方二进制或 volta-shim 等二进制垫片，由上层结合 codesign 区分）
     if (hasMachOMagic(realTarget)) {
       return {
+        classification: "native-macho",
         isNodeScript: false,
         isMachO: true,
         viaShellExecWrapper: depth > 0,
@@ -1203,7 +1320,7 @@ export function inspectCliBinaryKind(filePath: string, depth = 0): CliBinaryInsp
       };
     }
 
-    // 2. 非二进制文件：读取前 4KB 检查 Shebang 与 Shell exec 链路
+    // 2. 非二进制文件：读取前 4KB 检查报错桩文件、Shebang 与 Shell exec 链路
     const fd = openSync(realTarget, "r");
     const buf = Buffer.alloc(4096);
     const bytesRead = readSync(fd, buf, 0, 4096, 0);
@@ -1212,12 +1329,24 @@ export function inspectCliBinaryKind(filePath: string, depth = 0): CliBinaryInsp
     const text = buf.subarray(0, bytesRead).toString("utf8");
     const firstLine = (text.split(/\r?\n/, 1)[0] || "").trim();
 
-    // 2a. 直接由 node / bun / deno 解释执行的 JS 脚本（如旧版 cli.js 或 cli-wrapper.cjs）
+    // 2a. `@anthropic-ai/claude-code` 跳过 postinstall（如 pnpm v10 默认拦截或 --ignore-scripts）时残留的无 #! 9 行报错桩脚本
+    if (/claude native binary not installed/i.test(text)) {
+      return {
+        classification: "uninstalled-stub",
+        isNodeScript: false,
+        isMachO: false,
+        viaShellExecWrapper: depth > 0,
+        resolvedBinaryPath: realTarget,
+      };
+    }
+
+    // 2b. 直接由 node / bun / deno 解释执行的 JS 脚本（如旧版 cli.js 或 cli-wrapper.cjs）
     if (
       (firstLine.startsWith("#!") && /\b(node|bun|deno)\b/i.test(firstLine)) ||
       /\.(c?js|mjs)$/i.test(realTarget)
     ) {
       return {
+        classification: "node-script",
         isNodeScript: true,
         isMachO: false,
         viaShellExecWrapper: depth > 0,
@@ -1225,7 +1354,7 @@ export function inspectCliBinaryKind(filePath: string, depth = 0): CliBinaryInsp
       };
     }
 
-    // 2b. pnpm / npm cmd-shim 生成的 POSIX Shell 包装脚本（如 #!/bin/sh ... exec "$basedir/.../bin/claude.exe" "$@"）
+    // 2c. POSIX Shell 包装脚本（如 pnpm cmd-shim 或 asdf / mise 动态垫片）
     if (firstLine.startsWith("#!") && /\b(sh|bash|zsh|dash)\b/i.test(firstLine)) {
       const baseDir = dirname(realTarget);
       const lines = text
@@ -1242,6 +1371,7 @@ export function inspectCliBinaryKind(filePath: string, depth = 0): CliBinaryInsp
           /\.(c?js|mjs)["']?(?:\s|$)/i.test(line)
         ) {
           return {
+            classification: "node-script",
             isNodeScript: true,
             isMachO: false,
             viaShellExecWrapper: true,
@@ -1249,7 +1379,18 @@ export function inspectCliBinaryKind(filePath: string, depth = 0): CliBinaryInsp
           };
         }
 
-        // 提取 exec 指向的目标可执行路径（替换 $basedir / ${basedir}）
+        // 若 exec 转发给 asdf / mise / rtx / volta / nodenv 等版本管理器分发器，无法静态确认最终二进制签名
+        if (/^exec\s+(?:["']?[^"'\s]*\/)?(?:asdf|mise|rtx|volta|volta-shim|nodenv|anyenv)["']?(?:\s|$)/i.test(line)) {
+          return {
+            classification: "unknown-shim",
+            isNodeScript: false,
+            isMachO: false,
+            viaShellExecWrapper: true,
+            resolvedBinaryPath: realTarget,
+          };
+        }
+
+        // 提取 exec 指向的具体目标文件路径（替换 $basedir / ${basedir}）
         const quotedTarget = /^exec\s+"([^"]+)"/.exec(line) || /^exec\s+'([^']+)'/.exec(line);
         const bareTarget = !quotedTarget ? /^exec\s+(\S+)/.exec(line) : null;
         const rawExecExpr = quotedTarget?.[1] || bareTarget?.[1];
@@ -1270,6 +1411,7 @@ export function inspectCliBinaryKind(filePath: string, depth = 0): CliBinaryInsp
   }
 
   return {
+    classification: "unknown-shim",
     isNodeScript: false,
     isMachO: false,
     viaShellExecWrapper: depth > 0,
