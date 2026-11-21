@@ -7,3 +7,4 @@ dist-test/
 coverage/
 .env*
 report-*.html
+promo-assets/
