@@ -15,7 +15,7 @@
 1. **终端与后台辅助进程不吃系统代理**：如果只开了 Clash 的「系统代理」没开 TUN 虚拟网卡，浏览器走的是海外节点，但终端里的 `claude` 以及桌面端底层的辅助进程会直接走本地宽带出去。
 2. **第三方监控与反欺诈域名漏配直连**：除了 `claude.ai` 和 `api.anthropic.com`，客户端还会请求 `statsig.anthropic.com`、`featuregates.org`、`prodregistryv2.org`、`o1158394.ingest.us.sentry.io`、`us5.datadoghq.com`、`browser-intake-us5-datadoghq.com`（注意它是横杠不是子域名，`*.datadoghq.com` 通配符匹配不到）、`siftscience.com`、`r.stripe.com`、`api-iam.intercom.io` 等二十多个关联地址。这些第三方域名在国内没有被墙，分流规则漏掉任何一个，或者被国内白名单误放行，后台就会一边挂着海外会话一边用国内宽带 IP 上报遥测。
 3. **OAuth 授权登录时的双出口错位**：首次登录或重新授权时，桌面端会拉起系统默认浏览器。如果浏览器里开了代理扩展走节点 A，跳回桌面端走 TUN 节点 B（或直连），同一个登录流程一秒内切了两个 IP。
-4. **`npm` 版 CLI 的防火墙盲区与隐藏二进制**：通过 `npm install -g` 装的 Claude Code 底层进程名叫 `node`，按应用名拦截的防火墙（如 LuLu）没法单独拦它；另外 `~/Library/Application Support/Claude/claude-code/` 以及 VS Code / Cursor 扩展目录里还会各自带一份独立的原生二进制，只拦 `/Applications/Claude.app` 会漏掉它们。
+4. **旧版 `node` 脚本盲区与多路径隐藏二进制**：早期纯 JS 版或未完成 `postinstall` 原生替换的 CLI 底层驻留进程是 `node`，防火墙没法按签名把它和普通前端进程区分开；而新版（2.1.x）虽已落地原生二进制，但 `~/Library/Application Support/Claude/claude-code/`、npm/pnpm 全局目录与 VS Code / Cursor 扩展目录会各自存一份独立副本，如果防火墙只按 `/Applications/Claude.app/*` 路径拦截而没配签名规则，其他入口照样会漏。
 5. **代理闪退、休眠唤醒与开机抢跑**：只靠 Clash 内部规则防不住 Clash 自己崩溃退出，也防不住重启电脑时 Claude 比 Clash 早启动两秒。没有系统防火墙兜底的话，断梯子那几秒重连就会直接走物理网卡连上 Sentry / Datadog。
 
 ## 检查内容

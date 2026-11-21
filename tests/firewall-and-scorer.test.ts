@@ -1,14 +1,77 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { DOMAIN_MATRIX } from "../src/core/domains.js";
 import { runFullAudit } from "../src/core/engine.js";
 import { evaluateAuditScores } from "../src/core/scorer.js";
+import { inspectCliBinaryKind } from "../src/platforms/darwin.js";
 import {
   extractLaunchDaemonLabelAndScripts,
   hasMacosPfDeadlockPattern,
   isLaunchDaemonActive,
   parseLuluRules,
 } from "../src/platforms/lulu-parser.js";
+
+test("inspectCliBinaryKind distinguishes modern npm/pnpm native Mach-O wrappers (2.1.330+) from true Node.js scripts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-bin-test-"));
+  try {
+    // 构造模拟的 Mach-O 64-bit arm64 原生二进制头 (0xcffaedfe)
+    const pkgBinDir = join(dir, "lib/node_modules/@anthropic-ai/claude-code/bin");
+    mkdirSync(pkgBinDir, { recursive: true });
+    const nativeExe = join(pkgBinDir, "claude.exe");
+    const machoHeader = Buffer.alloc(32);
+    machoHeader.writeUInt32BE(0xcffaedfe, 0);
+    writeFileSync(nativeExe, machoHeader);
+
+    // 1. 新版 npm 全局软链 -> node_modules/@anthropic-ai/claude-code/bin/claude.exe (原生 Mach-O)
+    const npmBinDir = join(dir, "bin");
+    mkdirSync(npmBinDir, { recursive: true });
+    const npmLink = join(npmBinDir, "claude");
+    symlinkSync("../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe", npmLink);
+
+    const npmInspected = inspectCliBinaryKind(npmLink);
+    assert.equal(npmInspected.isMachO, true);
+    assert.equal(npmInspected.isNodeScript, false);
+
+    // 2. 新版 pnpm `.bin/claude` Shell 启动脚本 -> exec 原生 Mach-O 二进制（无 node 调用）
+    const pnpmShim = join(dir, "pnpm-claude");
+    writeFileSync(
+      pnpmShim,
+      `#!/bin/sh\nbasedir=$(dirname "$(echo "$0" | sed -e 's,\\\\,/,g')")\nexec "$basedir/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" "$@"\n`,
+      "utf8"
+    );
+    const pnpmInspected = inspectCliBinaryKind(pnpmShim);
+    assert.equal(pnpmInspected.isMachO, true);
+    assert.equal(pnpmInspected.isNodeScript, false);
+    assert.equal(pnpmInspected.viaShellExecWrapper, true);
+    assert.ok(pnpmInspected.resolvedBinaryPath.endsWith("bin/claude.exe"));
+
+    // 3. 旧版纯 JS 包 -> #!/usr/bin/env node cli.js
+    const legacyJs = join(pkgBinDir, "cli.js");
+    writeFileSync(legacyJs, "#!/usr/bin/env node\nconsole.log('legacy');\n", "utf8");
+    const legacyLink = join(npmBinDir, "claude-legacy");
+    symlinkSync("../lib/node_modules/@anthropic-ai/claude-code/bin/cli.js", legacyLink);
+
+    const legacyInspected = inspectCliBinaryKind(legacyLink);
+    assert.equal(legacyInspected.isNodeScript, true);
+    assert.equal(legacyInspected.isMachO, false);
+
+    // 4. Shell 包装器显式调用 exec node ... cli-wrapper.cjs
+    const nodeShim = join(dir, "pnpm-node-claude");
+    writeFileSync(
+      nodeShim,
+      `#!/bin/sh\nbasedir=$(dirname "$0")\nexec node "$basedir/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs" "$@"\n`,
+      "utf8"
+    );
+    const nodeShimInspected = inspectCliBinaryKind(nodeShim);
+    assert.equal(nodeShimInspected.isNodeScript, true);
+    assert.equal(nodeShimInspected.isMachO, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("DOMAIN_MATRIX contains 27 targets including assets-proxy and bridge subdomains", () => {
   assert.equal(DOMAIN_MATRIX.length, 27);

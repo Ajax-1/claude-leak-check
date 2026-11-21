@@ -13,7 +13,12 @@ export {
   type SettingsAndProxyEnvResult,
 } from "./core/settings-env-inspector.js";
 export { evaluateAuditScores } from "./core/scorer.js";
-export { classifyAsnOrg, extractListeningLoopbackPortsMac } from "./platforms/darwin.js";
+export {
+  classifyAsnOrg,
+  extractListeningLoopbackPortsMac,
+  inspectCliBinaryKind,
+  type CliBinaryInspection,
+} from "./platforms/darwin.js";
 export {
   parseAppleXmlPlist,
   unarchiveNsKeyedPlist,

@@ -7,11 +7,12 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   readSync,
   statSync,
 } from "node:fs";
 import { homedir, networkInterfaces } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { REGION_NAMES, RESTRICTED_REGIONS } from "../core/domains.js";
 import {
@@ -715,13 +716,18 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
       if (existsSync(extra)) globalCandidates.add(extra);
     }
 
+    const seenResolvedCliTargets = new Set<string>();
     for (const cliPath of globalCandidates) {
       if (!existsSync(cliPath)) continue;
       const binType = inspectCliBinaryKind(cliPath);
+      const dedupeKey = binType.resolvedBinaryPath || cliPath;
+      if (seenResolvedCliTargets.has(dedupeKey)) continue;
+      seenResolvedCliTargets.add(dedupeKey);
+
       if (binType.isNodeScript) {
         binaries.push({
           id: `global-npm-${cliPath}`,
-          name: "全局终端 claude (npm / Node.js 脚本版)",
+          name: "全局终端 claude (Node.js 脚本运行时)",
           displayPath: sanitizePath(cliPath),
           kind: "global-cli-npm-node",
           exists: true,
@@ -729,17 +735,21 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
           firewallCovered: false,
           riskLevel: "critical",
           note: {
-            zh: "高危盲区：底层联网进程名为 node，LuLu 等按应用名防火墙无法单独拦截（除非把整机 Node 开发环境全断网），强烈建议改用官方原生签名安装包！",
-            en: "High risk: runs under 'node' process, so per-app firewalls cannot block it without breaking all local Node dev tools. Switch to native signed installer!",
+            zh: "底层实际驻留进程为 node（常见于旧版 JS 包或未拉取原生二进制的 fallback 包装器），应用防火墙无法按签名单独隔离，建议升级至包含原生 Mach-O 二进制的新版或使用官方独立安装器。",
+            en: "Runs inside the 'node' runtime (legacy JS build or fallback wrapper), preventing per-app firewall isolation without blocking all Node dev tools.",
           },
         });
       } else {
-        const codesignOut = await runCmd("/usr/bin/codesign", ["-dv", cliPath], 1500);
+        const signCheckTarget = binType.resolvedBinaryPath || cliPath;
+        const codesignOut = await runCmd("/usr/bin/codesign", ["-dv", signCheckTarget], 1500);
         const signed = /anthropic|Q6L2SF6YDW/i.test(codesignOut) || binType.isMachO;
+        const viaPkgManager = /node_modules|pnpm/i.test(signCheckTarget) || binType.viaShellExecWrapper;
         const covered = luluActive && luluSummary.coversAnthropicSigningId;
         binaries.push({
           id: `global-native-${cliPath}`,
-          name: "全局终端 claude (官方原生二进制)",
+          name: viaPkgManager
+            ? "全局终端 claude (npm/pnpm 分发原生二进制)"
+            : "全局终端 claude (官方原生二进制)",
           displayPath: sanitizePath(cliPath),
           kind: "global-cli-native",
           exists: true,
@@ -748,10 +758,13 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
           firewallCovered: covered,
           riskLevel: covered ? "pass" : "warn",
           note: covered
-            ? { zh: "官方原生签名二进制，已受防火墙代码签名规则锁定", en: "Native signed Mach-O binary covered by firewall" }
+            ? {
+                zh: "最终执行文件为带官方签名的原生 Mach-O 二进制，已受防火墙代码签名规则锁定",
+                en: "Executes Anthropic-signed native Mach-O binary covered by firewall signing rule",
+              }
             : {
-                zh: "官方原生二进制（优于 npm 版），建议在防火墙中按签名 com.anthropic.claude-code 锁定",
-                en: "Native binary (better than npm); add signing ID rule in firewall",
+                zh: "最终执行文件为带 Anthropic 签名的原生 Mach-O 二进制（无 node 驻留），可在防火墙中按签名 com.anthropic.claude-code 单独锁定",
+                en: "Executes Anthropic-signed native Mach-O binary (no Node runtime); lock via signing ID com.anthropic.claude-code in firewall",
               },
         });
       }
@@ -1127,47 +1140,141 @@ function extractPortFromProxyEnv(proxyUrl?: string): number | undefined {
   }
 }
 
-function inspectCliBinaryKind(filePath: string): { isNodeScript: boolean; isMachO: boolean } {
+export interface CliBinaryInspection {
+  isNodeScript: boolean;
+  isMachO: boolean;
+  viaShellExecWrapper: boolean;
+  resolvedBinaryPath: string;
+}
+
+function hasMachOMagic(filePath: string): boolean {
   try {
-    let realTarget = filePath;
+    const fd = openSync(filePath, "r");
+    const buf = Buffer.alloc(4);
+    const bytesRead = readSync(fd, buf, 0, 4, 0);
+    closeSync(fd);
+    if (bytesRead < 4) return false;
+    const magic = buf.readUInt32BE(0);
+    return (
+      magic === 0xcffaedfe ||
+      magic === 0xfeedfacf ||
+      magic === 0xcafebabe ||
+      magic === 0xbebafeca
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 追踪软链接与包管理器（pnpm / yarn / fnm）生成的 POSIX Shell `exec` 启动脚本，
+ * 准确区分「最终直接 exec 原生 Mach-O 签名二进制（新版 2.1.x npm/pnpm 分发包）」与「真正驻留 node 解释器的 JS 脚本」
+ */
+export function inspectCliBinaryKind(filePath: string, depth = 0): CliBinaryInspection {
+  if (depth > 4) {
+    return {
+      isNodeScript: false,
+      isMachO: false,
+      viaShellExecWrapper: false,
+      resolvedBinaryPath: filePath,
+    };
+  }
+
+  let realTarget = filePath;
+  try {
+    realTarget = realpathSync(filePath);
+  } catch {
     try {
       const linked = readlinkSync(filePath);
-      if (linked.includes("node_modules") || linked.endsWith(".js") || linked.endsWith(".mjs")) {
-        return { isNodeScript: true, isMachO: false };
-      }
-      realTarget = linked.startsWith("/") ? linked : join(filePath, "..", linked);
+      realTarget = linked.startsWith("/") ? linked : resolve(dirname(filePath), linked);
     } catch {
-      // not a symlink
+      // 普通文件非软链
+    }
+  }
+
+  try {
+    // 1. 先直接读取文件头判断是否为原生 Mach-O 可执行文件（新版 @anthropic-ai/claude-code postinstall 会把原生二进制写入 bin/claude.exe）
+    if (hasMachOMagic(realTarget)) {
+      return {
+        isNodeScript: false,
+        isMachO: true,
+        viaShellExecWrapper: depth > 0,
+        resolvedBinaryPath: realTarget,
+      };
     }
 
+    // 2. 非二进制文件：读取前 4KB 检查 Shebang 与 Shell exec 链路
     const fd = openSync(realTarget, "r");
-    const buf = Buffer.alloc(128);
-    const bytesRead = readSync(fd, buf, 0, 128, 0);
+    const buf = Buffer.alloc(4096);
+    const bytesRead = readSync(fd, buf, 0, 4096, 0);
     closeSync(fd);
 
-    if (bytesRead >= 4) {
-      const magic = buf.readUInt32BE(0);
-      if (
-        magic === 0xcffaedfe ||
-        magic === 0xfeedfacf ||
-        magic === 0xcafebabe ||
-        magic === 0xbebafeca
-      ) {
-        return { isNodeScript: false, isMachO: true };
-      }
+    const text = buf.subarray(0, bytesRead).toString("utf8");
+    const firstLine = (text.split(/\r?\n/, 1)[0] || "").trim();
+
+    // 2a. 直接由 node / bun / deno 解释执行的 JS 脚本（如旧版 cli.js 或 cli-wrapper.cjs）
+    if (
+      (firstLine.startsWith("#!") && /\b(node|bun|deno)\b/i.test(firstLine)) ||
+      /\.(c?js|mjs)$/i.test(realTarget)
+    ) {
+      return {
+        isNodeScript: true,
+        isMachO: false,
+        viaShellExecWrapper: depth > 0,
+        resolvedBinaryPath: realTarget,
+      };
     }
 
-    const head = buf.subarray(0, bytesRead).toString("utf8");
-    if (head.startsWith("#!") && /\b(node|bun|deno)\b/i.test(head)) {
-      return { isNodeScript: true, isMachO: false };
-    }
-    if (realTarget.includes("node_modules")) {
-      return { isNodeScript: true, isMachO: false };
+    // 2b. pnpm / npm cmd-shim 生成的 POSIX Shell 包装脚本（如 #!/bin/sh ... exec "$basedir/.../bin/claude.exe" "$@"）
+    if (firstLine.startsWith("#!") && /\b(sh|bash|zsh|dash)\b/i.test(firstLine)) {
+      const baseDir = dirname(realTarget);
+      const lines = text
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#"));
+
+      for (const line of lines) {
+        if (!line.startsWith("exec ")) continue;
+
+        // 若 exec 调用的是 node / bun / deno 解释器，则运行时确实驻留 node 进程
+        if (
+          /^exec\s+(?:["']?[^"'\s]*\/)?(?:node|bun|deno)(?:\.exe)?["']?\s/i.test(line) ||
+          /\.(c?js|mjs)["']?(?:\s|$)/i.test(line)
+        ) {
+          return {
+            isNodeScript: true,
+            isMachO: false,
+            viaShellExecWrapper: true,
+            resolvedBinaryPath: realTarget,
+          };
+        }
+
+        // 提取 exec 指向的目标可执行路径（替换 $basedir / ${basedir}）
+        const quotedTarget = /^exec\s+"([^"]+)"/.exec(line) || /^exec\s+'([^']+)'/.exec(line);
+        const bareTarget = !quotedTarget ? /^exec\s+(\S+)/.exec(line) : null;
+        const rawExecExpr = quotedTarget?.[1] || bareTarget?.[1];
+        if (rawExecExpr) {
+          const expanded = rawExecExpr
+            .replace(/\$\{?basedir\}?/g, baseDir)
+            .replace(/\$\(dirname\s+[^)]+\)/g, baseDir);
+          const candidatePath = expanded.startsWith("/") ? expanded : resolve(baseDir, expanded);
+          if (existsSync(candidatePath) && candidatePath !== realTarget) {
+            const inner = inspectCliBinaryKind(candidatePath, depth + 1);
+            return { ...inner, viaShellExecWrapper: true };
+          }
+        }
+      }
     }
   } catch {
     // ignore
   }
-  return { isNodeScript: false, isMachO: false };
+
+  return {
+    isNodeScript: false,
+    isMachO: false,
+    viaShellExecWrapper: depth > 0,
+    resolvedBinaryPath: realTarget,
+  };
 }
 
 async function detectDefaultBrowserMac(home: string): Promise<string> {

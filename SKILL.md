@@ -52,6 +52,6 @@ npx claude-leak-check
    - 物理网卡存在可直通外网的国内运营商公网 IPv6（`240e:` / `2408:` / `2409:`）。
    - 默认浏览器出口与终端出口不一致（OAuth 授权跳回桌面端时产生双 IP 切换）。
 2. **次要风险与加固建议**：
-   - 全局 `claude` 若由 `npm` 安装，系统内核看到的进程名为 `node`，LuLu 等按应用拦截的防火墙无法单独锁定它，建议改用官方原生签名二进制。
+   - 全局 `claude` 若仍为旧版纯 JS 脚本或未完成原生替换的 `node` 包装器（底层驻留进程为 `node`），应用防火墙无法按 Anthropic 签名单独隔离，建议升级至包含原生 Mach-O 二进制的新版或改用官方独立安装器；若为新版原生二进制，则需确认防火墙已按 `com.anthropic.claude-code` 代码签名锁定。
    - 若检测到运行中的旧版 `user != root` PF 脚本，提醒其在 macOS 上容易触发内核 socket 锁死锁导致 Wi-Fi 卡死，建议改用 LuLu 等 Network Extension 防火墙。
    - 若用户决定修改网络或防火墙规则，提醒先退出 Claude Desktop 与所有登录态的 Claude Code 终端再操作。

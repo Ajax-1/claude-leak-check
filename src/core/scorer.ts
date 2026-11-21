@@ -521,16 +521,16 @@ export function evaluateAuditScores(input: ScoringInputs): ScoringOutput {
       pointsDeducted: 10,
       triggersRedline: false,
       title: {
-        zh: `发现 npm / Node.js 脚本版全局 claude (${npmCli.displayPath})`,
-        en: `Detected npm / Node.js script-based global 'claude' (${npmCli.displayPath})`,
+        zh: `发现基于 Node.js 解释器运行的全局 claude 脚本 (${npmCli.displayPath})`,
+        en: `Detected Node.js-interpreted global 'claude' script (${npmCli.displayPath})`,
       },
       detail: {
-        zh: "通过 npm 安装的 Claude Code 在系统内核与防火墙眼里进程名叫 `node` 而非 `claude`！这意味着 LuLu / Little Snitch 等应用级防火墙根本无法单独拦截它（除非把你电脑上所有前端/Node 开发工具一起断网）。",
-        en: "npm-installed Claude Code executes as `node`, making it impossible for per-app firewalls like LuLu to block it without blocking all Node.js development on your machine.",
+        zh: "该入口实际驻留进程为 `node`（常见于旧版纯 JS 包或未完成原生二进制替换的 fallback 脚本），LuLu / Little Snitch 等防火墙无法通过 Anthropic 签名将其与普通前端 Node 进程区分开。",
+        en: "This entrypoint executes inside the generic `node` runtime rather than Anthropic's signed native binary, preventing signature-based firewall isolation.",
       },
       remediation: {
-        zh: "建议卸载全局 npm 版 (`npm uninstall -g @anthropic-ai/claude-code`)，改用 Anthropic 官方带独立 Apple 代码签名的原生二进制安装方式。",
-        en: "Uninstall the global npm package and switch to Anthropic's official native signed binary installer.",
+        zh: "建议升级至包含原生 Mach-O 二进制的新版 `@anthropic-ai/claude-code`（确保未开启 `--ignore-scripts` / `--omit=optional`），或改用官方独立安装器。",
+        en: "Upgrade to a modern native-binary release (without `--ignore-scripts` / `--omit=optional`) or use Anthropic's standalone installer.",
       },
     });
   }
