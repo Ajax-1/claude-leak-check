@@ -7,6 +7,10 @@ export type Severity = "pass" | "info" | "warn" | "fail" | "critical";
 
 export type Grade = "S+" | "A+" | "A" | "B" | "C" | "D" | "F";
 
+export type ProxyTopologyPreference = "auto" | "host-tun" | "router-gateway";
+
+export type ResolvedProxyTopology = "host-tun" | "router-gateway";
+
 export type DomainCategory =
   | "core"
   | "feature_gate"
@@ -56,7 +60,7 @@ export interface PublicExitSnapshot {
   asnType: "isp" | "hosting" | "education" | "business" | "unknown";
   isSupportedRegion: boolean;
   isRestrictedRegion: boolean;
-  viaMode: "direct-socket-noproxy" | "system-proxy" | "ipv6";
+  viaMode: "direct-socket-noproxy" | "system-proxy" | "ipv6" | "non-gfw-echo";
   latencyMs: number;
 }
 
@@ -190,6 +194,9 @@ export interface AuditReport {
   osRelease: string;
   arch: string;
   demoMode?: string;
+  topologyPreference: ProxyTopologyPreference;
+  resolvedTopology: ResolvedProxyTopology;
+  routerAutoDetected: boolean;
   privacyNote: BilingualText;
 
   // Scores & Grades
@@ -202,6 +209,8 @@ export interface AuditReport {
 
   // Primary Exit Summary
   primaryExit?: PublicExitSnapshot;
+  nonGfwExit?: PublicExitSnapshot;
+  nonGfwMatchesPrimary?: boolean;
   systemProxyExit?: PublicExitSnapshot;
   ipv6Exit?: PublicExitSnapshot;
   cliExitIpHash?: string;
@@ -218,6 +227,8 @@ export interface AuditReport {
     systemLocale: string;
     defaultBrowser: string;
     activeUtunInterfaces: string[];
+    defaultRouteInterface: string;
+    defaultGatewayMasked?: string;
     dnsServersMasked: string[];
     tailscaleMagicDns: boolean;
     icloudPrivateRelaySuspected: boolean;

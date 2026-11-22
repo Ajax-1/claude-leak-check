@@ -109,13 +109,20 @@ export class Win32PlatformAdapter implements PlatformAdapter {
     options: AuditOptions
   ): Promise<{
     primaryExit?: PublicExitSnapshot;
+    nonGfwExit?: PublicExitSnapshot;
+    nonGfwExitIpHash?: string;
     systemProxyExit?: PublicExitSnapshot;
     ipv6Exit?: PublicExitSnapshot;
     cliExitIpHash?: string;
   }> {
-    const [trace, ipinfo] = await Promise.all([
+    const shouldProbeNonGfw =
+      netSnap.activeUtunInterfaces.length === 0 || options.topologyPreference === "router-gateway";
+    const [trace, ipinfo, awsRes] = await Promise.all([
       httpsGetText("https://1.1.1.1/cdn-cgi/trace", 4, 3200),
       httpsGetText("https://ipinfo.io/json", 4, 3200),
+      shouldProbeNonGfw
+        ? httpsGetText("https://checkip.amazonaws.com", 4, 2800)
+        : Promise.resolve(null),
     ]);
     let primaryExit: PublicExitSnapshot | undefined;
     let cliExitIpHash: string | undefined;
@@ -186,16 +193,49 @@ export class Win32PlatformAdapter implements PlatformAdapter {
       }
     }
 
-    return { primaryExit, ipv6Exit, cliExitIpHash };
+    let nonGfwExit: PublicExitSnapshot | undefined;
+    let nonGfwExitIpHash: string | undefined;
+    const awsIp = awsRes?.ok && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(awsRes.body.trim()) ? awsRes.body.trim() : undefined;
+    const ipinfoIp = typeof ipinfoJson.ip === "string" && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(ipinfoJson.ip.trim())
+      ? ipinfoJson.ip.trim()
+      : undefined;
+    const nonGfwRawIp = awsIp || ipinfoIp;
+    if (nonGfwRawIp) {
+      nonGfwExitIpHash = hashIpForComparison(nonGfwRawIp, options.sessionSalt);
+      const sameAsPrimary = Boolean(cliExitIpHash && nonGfwExitIpHash === cliExitIpHash);
+      const cc = (
+        (ipinfoIp === nonGfwRawIp && typeof ipinfoJson.country === "string"
+          ? ipinfoJson.country
+          : sameAsPrimary && primaryExit
+            ? primaryExit.countryCode
+            : "UNKNOWN") || "UNKNOWN"
+      ).toUpperCase();
+      nonGfwExit = {
+        source: awsIp ? "aws-checkip" : "ipinfo-direct",
+        ipMasked: maskIp(nonGfwRawIp),
+        ipRawForLocalToggle: nonGfwRawIp,
+        countryCode: cc,
+        countryName: REGION_NAMES[cc] || { zh: cc, en: cc },
+        asnType: sameAsPrimary && primaryExit ? primaryExit.asnType : "unknown",
+        isSupportedRegion: !RESTRICTED_REGIONS.has(cc) && cc !== "UNKNOWN",
+        isRestrictedRegion: RESTRICTED_REGIONS.has(cc),
+        viaMode: "non-gfw-echo",
+        latencyMs: awsRes?.latencyMs ?? ipinfo.latencyMs,
+      };
+    }
+
+    return { primaryExit, nonGfwExit, nonGfwExitIpHash, ipv6Exit, cliExitIpHash };
   }
 
   async probeDomainMatrix(
     targets: DomainTarget[],
     _proxyAudit: ProxyStaticAudit,
-    primaryExit: PublicExitSnapshot | undefined
+    primaryExit: PublicExitSnapshot | undefined,
+    options: AuditOptions
   ): Promise<DomainProbeResult[]> {
     const netSnap = await this.getNetworkSnapshot();
     const hasTun = netSnap.activeUtunInterfaces.length > 0;
+    const isRouterMode = options.resolvedTopology === "router-gateway";
 
     return Promise.all(
       targets.map(async (target) => {
@@ -214,7 +254,13 @@ export class Win32PlatformAdapter implements PlatformAdapter {
         }
         const firstIpv4 = resolvedIps.find((ip) => !ip.includes(":")) || "";
         const fakeIp = firstIpv4 ? isFakeIpv4(firstIpv4) : false;
-        const isTunRouted = hasTun || fakeIp;
+        const isPoisoned = firstIpv4 === "0.0.0.0" || firstIpv4.startsWith("127.");
+        const isTunRouted = isRouterMode ? Boolean(firstIpv4 && !isPoisoned) : hasTun || fakeIp;
+        const gfwSplitLeak =
+          isRouterMode &&
+          options.nonGfwMatchesPrimary === false &&
+          !target.officialAnthropic &&
+          target.host !== "accounts.google.com";
 
         return {
           host: target.host,
@@ -226,16 +272,35 @@ export class Win32PlatformAdapter implements PlatformAdapter {
           maskedResolvedIps: resolvedIps.slice(0, 3).map((ip) => maskIp(ip)),
           isFakeIp: fakeIp,
           hasIpv6Resolution,
-          routeInterface: isTunRouted ? netSnap.activeUtunInterfaces[0] || "WinTUN" : "Physical NIC",
+          routeInterface: isRouterMode
+            ? "Ethernet/Wi-Fi (GW)"
+            : isTunRouted
+              ? netSnap.activeUtunInterfaces[0] || "WinTUN"
+              : "Physical NIC",
           isTunRouted,
           staticRuleDecision: "unknown",
           edgeExitIpMasked: primaryExit?.ipMasked,
           edgeCountry: primaryExit?.countryCode,
           probeMode: "local-zero-packet",
-          status: !isTunRouted ? "critical" : fakeIp || target.category === "raw_ip" ? "pass" : "warn",
-          statusReason: isTunRouted
-            ? { zh: "已由虚拟网卡接管", en: "Intercepted by virtual TUN adapter" }
-            : { zh: "未检测到活跃 WinTUN 虚拟网卡接管", en: "No active WinTUN adapter detected" },
+          status:
+            !isTunRouted || isPoisoned || gfwSplitLeak || primaryExit?.isRestrictedRegion
+              ? "critical"
+              : isRouterMode || fakeIp || target.category === "raw_ip"
+                ? "pass"
+                : "warn",
+          statusReason: gfwSplitLeak
+            ? {
+                zh: "软路由疑似开启 GFWList 绕过模式，未被墙风控域名将直连暴露宽带",
+                en: "Router appears in GFWList mode; unblocked telemetry bypasses proxy",
+              }
+            : isRouterMode
+              ? {
+                  zh: "经局域网透明网关转发，与海外主出口同源",
+                  en: "Routed via LAN transparent gateway aligned with primary exit",
+                }
+              : isTunRouted
+                ? { zh: "已由虚拟网卡接管", en: "Intercepted by virtual TUN adapter" }
+                : { zh: "未检测到活跃 WinTUN 虚拟网卡接管", en: "No active WinTUN adapter detected" },
         };
       })
     );
@@ -364,7 +429,7 @@ export class Win32PlatformAdapter implements PlatformAdapter {
     };
   }
 
-  async runKillSwitchProbe(): Promise<KillSwitchProbeSnapshot> {
+  async runKillSwitchProbe(sessionSalt?: string): Promise<KillSwitchProbeSnapshot> {
     const netSnap = await this.getNetworkSnapshot();
     const probe = await httpsGetText("https://1.1.1.1/cdn-cgi/trace", 4, 2500);
     if (!probe.ok) {
@@ -385,6 +450,7 @@ export class Win32PlatformAdapter implements PlatformAdapter {
       blocked: false,
       latencyMs: probe.latencyMs,
       leakedIpMasked: lines.ip ? maskIp(lines.ip) : undefined,
+      leakedIpHash: lines.ip && sessionSalt ? hashIpForComparison(lines.ip, sessionSalt) : undefined,
       leakedCountry: lines.loc?.toUpperCase(),
     };
   }

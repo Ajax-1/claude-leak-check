@@ -1,6 +1,11 @@
 export { BRAND, type BrandConfig } from "./config/brand.js";
 export { DOMAIN_MATRIX, RESTRICTED_REGIONS, REGION_NAMES } from "./core/domains.js";
-export { runFullAudit, stripLocalToggleRawFields, type RunAuditConfig } from "./core/engine.js";
+export {
+  runFullAudit,
+  resolveProxyTopology,
+  stripLocalToggleRawFields,
+  type RunAuditConfig,
+} from "./core/engine.js";
 export {
   maskIp,
   sanitizePath,

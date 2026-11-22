@@ -20,7 +20,7 @@
 
 ## 检查内容
 
-- **27 项关联域名与纯 IP 路由核验**：检查主站、资源桥接域（`assets-proxy` / `bridge`）、Statsig 灰度开关、Sentry / Datadog 遥测、Sift / Stripe / Intercom 以及无域名纯 IP（`1.1.1.1`）是否全部进入 `utun` 虚拟网卡并命中 Fake-IP。
+- **27 项关联域名与纯 IP 路由核验（兼容本机 TUN 与软路由透明网关）**：检查主站、资源桥接域（`assets-proxy` / `bridge`）、Statsig 灰度开关、Sentry / Datadog 遥测、Sift / Stripe / Intercom 以及无域名纯 IP（`1.1.1.1`）是否全部同源接管；自动识别 OpenWrt（OpenClash / PassWall / Nikki）、Surge Mac Gateway 等局域网软路由/旁路由拓扑（也可通过 `--router` 或报告页顶部按钮一键切换），并通过对比被墙源与非 GFW 国际源（AWS）真实出口精准排查「软路由 GFWList 漏分流」与「旁路由网关/DNS/IPv6 错位」。
 - **默认浏览器 vs 终端出口实时比对 + WebRTC 自检**：本地报告页打开时，自动比对当前浏览器出口与终端底层出口是否同源，并在本地检测 WebRTC STUN 是否穿透暴露真实公网 IP。
 - **本机安装入口与防火墙覆盖度审计**：盘点 `Claude.app`（含 4 个 Chromium Helper、`ShipIt` 更新器、`coworkd`）、后台 `claude-code`、IDE 插件二进制及全局 `claude` 来源；无 `sudo` 解析 Objective-See LuLu（含 v4.x `NSKeyedArchiver` 格式）的生效阻断规则与 Fake-IP CIDR 模式配置，并排查 macOS 上容易引发内核死锁卡死 Wi-Fi 的旧版 `user != root` PF 脚本。
 - **网络栈与主机环境检查**：排查国内运营商公网 IPv6 双栈抢跑、Tailscale MagicDNS (`100.100.100.100`) / iCloud 专用代理抢 DNS、Clash 策略组自动回落隐患、系统时区（`Asia/Shanghai`）、`~/.claude/settings.json` 中的代理/第三方中转配置以及本地反代进程。
@@ -65,12 +65,14 @@ npx claude-leak-check --json
 
 | 参数 | 说明 |
 | :--- | :--- |
+| `--router`, `--gateway` | 按「软路由 / 局域网透明网关」标准评估（不强制要求本机 `utun`，重点校验非 GFW 源分流一致性与旁路由 DNS/IPv6） |
+| `--host-tun` | 强制按「本机 TUN 虚拟网卡」标准评估 |
 | `--markdown`, `--md` | 在终端输出脱敏 Markdown 报告并退出 |
 | `--json` | 在终端输出脱敏 JSON 报告并退出 |
 | `--export <file.html>` | 导出单文件离线静态 HTML 报告 |
 | `--no-open` | 启动本地 `127.0.0.1` 报告服务但不自动弹浏览器 |
 | `--no-proxy-config` | 跳过本地代理 YAML 静态策略检查 |
-| `--demo <safe\|leak>` | 使用内置测试数据预览报告界面，不探测本机网络 |
+| `--demo <safe\|leak\|router>` | 使用内置测试数据预览报告界面，不探测本机网络 |
 
 ## 隐私与安全说明
 

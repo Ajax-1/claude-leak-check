@@ -21,6 +21,12 @@ description: 本地只读检测 Claude Desktop 与 Claude Code 的分流完整�
 npx claude-leak-check --markdown
 ```
 
+如果用户的代理部署在 OpenWrt 软路由 / 旁路由透明网关上（本机未安装代理客户端），工具默认会自动识别透明网关拓扑，也可显式加上 `--router` 参数：
+
+```bash
+npx claude-leak-check --router --markdown
+```
+
 如果在已克隆的仓库目录内运行，可执行：
 
 ```bash

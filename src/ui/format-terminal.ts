@@ -29,10 +29,18 @@ export function formatTerminalSummary(report: AuditReport, lang: "zh" | "en" = "
   );
   lines.push(`${C.dim}────────────────────────────────────────────────────────────────${C.reset}`);
 
+  const modeLabel =
+    report.resolvedTopology === "router-gateway"
+      ? lang === "zh"
+        ? `软路由/透明网关${report.routerAutoDetected ? " (自动识别)" : ""}`
+        : `Router Gateway${report.routerAutoDetected ? " (Auto)" : ""}`
+      : lang === "zh"
+        ? "本机 TUN 模式"
+        : "Host TUN Mode";
   lines.push(
     `${C.bold}${lang === "zh" ? "综合评分" : "Score"}:${C.reset} ${gradeColor}${C.bold}${
       report.finalScore
-    }/100 (${report.grade})${C.reset} ${C.dim}[${report.durationMs}ms]${C.reset}`
+    }/100 (${report.grade})${C.reset} ${C.dim}[${modeLabel} · ${report.durationMs}ms]${C.reset}`
   );
 
   if (report.primaryExit) {
@@ -108,11 +116,21 @@ export function formatMarkdownReport(report: AuditReport, lang: "zh" | "en" = "z
         : "Offline"
     }\``
   );
-  lines.push(
-    `- **${lang === "zh" ? "活跃 TUN 网卡" : "Active TUN"}**: \`${
-      report.environmentSummary.activeUtunInterfaces.join(", ") || "NONE (OFF)"
-    }\``
-  );
+  if (report.resolvedTopology === "router-gateway") {
+    lines.push(
+      `- **${lang === "zh" ? "代理拓扑模式" : "Proxy Topology"}**: \`${
+        lang === "zh" ? "局域网软路由 / 透明网关" : "LAN Router / Transparent Gateway"
+      } (${report.environmentSummary.defaultRouteInterface} -> ${
+        report.environmentSummary.defaultGatewayMasked || "LAN"
+      })\``
+    );
+  } else {
+    lines.push(
+      `- **${lang === "zh" ? "活跃 TUN 网卡" : "Active TUN"}**: \`${
+        report.environmentSummary.activeUtunInterfaces.join(", ") || "NONE (OFF)"
+      }\``
+    );
+  }
   lines.push(
     `- **${lang === "zh" ? "关联域名同源率" : "Domain Matrix"}**: **${passDom} / ${
       report.domainMatrix.length

@@ -16,7 +16,7 @@ import type {
   PlatformAdapter,
 } from "./types.js";
 
-export type DemoScenario = "safe" | "leak";
+export type DemoScenario = "safe" | "leak" | "router";
 
 /**
  * 100% 纯虚构脱敏演示适配器（仅使用 RFC 5737 文档测试保留 IP 段 198.51.100.x / 203.0.113.x）
@@ -33,6 +33,26 @@ export class MockPlatformAdapter implements PlatformAdapter {
         defaultRouteInterface: "utun4",
         dnsServers: ["198.18.0.2"],
         dnsServersMasked: ["198.18.*.* (Fake-IP)"],
+        tailscaleMagicDns: false,
+        icloudPrivateRelaySuspected: false,
+        competingVpns: [],
+        systemProxy: {
+          httpEnabled: false,
+          httpsEnabled: false,
+          socksEnabled: false,
+        },
+        publicIpv6Interfaces: [],
+      };
+    }
+
+    if (this.scenario === "router") {
+      return {
+        activeUtunInterfaces: [],
+        defaultRouteInterface: "en0",
+        defaultGatewayIp: "192.168.31.2",
+        defaultGatewayMasked: "192.168.*.* (LAN)",
+        dnsServers: ["192.168.31.2"],
+        dnsServersMasked: ["192.168.*.* (LAN)"],
         tailscaleMagicDns: false,
         icloudPrivateRelaySuspected: false,
         competingVpns: [],
@@ -75,29 +95,40 @@ export class MockPlatformAdapter implements PlatformAdapter {
     options: AuditOptions
   ): Promise<{
     primaryExit?: PublicExitSnapshot;
+    nonGfwExit?: PublicExitSnapshot;
+    nonGfwExitIpHash?: string;
     systemProxyExit?: PublicExitSnapshot;
     ipv6Exit?: PublicExitSnapshot;
     cliExitIpHash?: string;
   }> {
-    if (this.scenario === "safe") {
+    if (this.scenario === "safe" || this.scenario === "router") {
       const mockUsIp = "198.51.100.42";
+      const ipHash = hashIpForComparison(mockUsIp, options.sessionSalt);
+      const exitObj: PublicExitSnapshot = {
+        source: "cloudflare-1.1.1.1 (mock)",
+        ipMasked: maskIp(mockUsIp),
+        ipRawForLocalToggle: mockUsIp,
+        countryCode: "US",
+        countryName: REGION_NAMES.US,
+        region: "California",
+        city: "Los Angeles",
+        asn: "AS7922",
+        org: "Comcast Cable Communications",
+        asnType: "isp",
+        isSupportedRegion: true,
+        isRestrictedRegion: false,
+        viaMode: "direct-socket-noproxy",
+        latencyMs: 142,
+      };
       return {
-        cliExitIpHash: hashIpForComparison(mockUsIp, options.sessionSalt),
-        primaryExit: {
-          source: "cloudflare-1.1.1.1 (mock)",
-          ipMasked: maskIp(mockUsIp),
-          ipRawForLocalToggle: mockUsIp,
-          countryCode: "US",
-          countryName: REGION_NAMES.US,
-          region: "California",
-          city: "Los Angeles",
-          asn: "AS7922",
-          org: "Comcast Cable Communications",
-          asnType: "isp",
-          isSupportedRegion: true,
-          isRestrictedRegion: false,
-          viaMode: "direct-socket-noproxy",
-          latencyMs: 142,
+        cliExitIpHash: ipHash,
+        primaryExit: exitObj,
+        nonGfwExitIpHash: ipHash,
+        nonGfwExit: {
+          ...exitObj,
+          source: "aws-checkip (mock)",
+          viaMode: "non-gfw-echo",
+          latencyMs: 158,
         },
       };
     }
@@ -151,11 +182,13 @@ export class MockPlatformAdapter implements PlatformAdapter {
   async probeDomainMatrix(
     targets: DomainTarget[],
     _proxyAudit: ProxyStaticAudit,
-    primaryExit: PublicExitSnapshot | undefined
+    primaryExit: PublicExitSnapshot | undefined,
+    options: AuditOptions
   ): Promise<DomainProbeResult[]> {
     return targets.map((target, idx) => {
-      if (this.scenario === "safe") {
+      if (this.scenario === "safe" || this.scenario === "router") {
         const isRaw = target.category === "raw_ip";
+        const isRouter = this.scenario === "router" || options.resolvedTopology === "router-gateway";
         return {
           host: target.host,
           category: target.category,
@@ -166,17 +199,22 @@ export class MockPlatformAdapter implements PlatformAdapter {
           maskedResolvedIps: [isRaw ? "1.1.1.1" : "198.18.*.* (Fake-IP)"],
           isFakeIp: !isRaw,
           hasIpv6Resolution: false,
-          routeInterface: "utun4",
+          routeInterface: isRouter ? "en0 (GW)" : "utun4",
           isTunRouted: true,
-          staticRuleDecision: "proxy",
+          staticRuleDecision: isRouter ? "unknown" : "proxy",
           edgeExitIpMasked: primaryExit?.ipMasked,
           edgeCountry: "US",
           probeMode: "local-zero-packet",
           status: "pass",
-          statusReason: {
-            zh: `经 utun4 虚拟网卡接管${isRaw ? "" : " (Fake-IP 命中)"}，锁定美国同源出口`,
-            en: `Routed via utun4${isRaw ? "" : " (Fake-IP hijacked)"}, locked to US exit`,
-          },
+          statusReason: isRouter
+            ? {
+                zh: `经局域网透明网关 (en0)${isRaw ? "" : " Fake-IP"} 接管，锁定美国同源出口`,
+                en: `Routed via LAN transparent gateway (en0)${isRaw ? "" : " with Fake-IP"}, locked to US exit`,
+              }
+            : {
+                zh: `经 utun4 虚拟网卡接管${isRaw ? "" : " (Fake-IP 命中)"}，锁定美国同源出口`,
+                en: `Routed via utun4${isRaw ? "" : " (Fake-IP hijacked)"}, locked to US exit`,
+              },
         };
       }
 
@@ -210,6 +248,22 @@ export class MockPlatformAdapter implements PlatformAdapter {
   }
 
   async auditProxyConfigSafely(): Promise<ProxyStaticAudit> {
+    if (this.scenario === "router") {
+      return {
+        detectedClients: [],
+        configInspected: false,
+        localListenerPorts: [],
+        claudeTargetGroups: [],
+        autoFallbackRiskGroups: [],
+        manualSelectCautionGroups: [],
+        hasDirectInProxyGroups: false,
+        hasRestrictedRegionInGroups: false,
+        hasStealthDomainDirectRule: false,
+        finalMatchIsDirect: false,
+        ruleCount: 0,
+      };
+    }
+
     if (this.scenario === "safe") {
       return {
         detectedClients: ["Clash Verge Rev (Mihomo)"],
@@ -257,7 +311,7 @@ export class MockPlatformAdapter implements PlatformAdapter {
   }
 
   async scanBinariesAndFirewall(): Promise<{ binaries: ClaudeBinaryItem[]; firewall: FirewallAudit }> {
-    if (this.scenario === "safe") {
+    if (this.scenario === "safe" || this.scenario === "router") {
       return {
         binaries: [
           {
@@ -399,7 +453,7 @@ export class MockPlatformAdapter implements PlatformAdapter {
   }
 
   async inspectEnvironmentHygiene(): Promise<EnvironmentHygieneSnapshot> {
-    if (this.scenario === "safe") {
+    if (this.scenario === "safe" || this.scenario === "router") {
       return {
         systemTimezone: "Asia/Taipei",
         isMainlandTimezone: false,
@@ -438,8 +492,8 @@ export class MockPlatformAdapter implements PlatformAdapter {
     };
   }
 
-  async runKillSwitchProbe(): Promise<KillSwitchProbeSnapshot> {
-    if (this.scenario === "safe") {
+  async runKillSwitchProbe(sessionSalt?: string): Promise<KillSwitchProbeSnapshot> {
+    if (this.scenario === "safe" || this.scenario === "router") {
       return {
         tunActive: false,
         blocked: true,
@@ -452,6 +506,7 @@ export class MockPlatformAdapter implements PlatformAdapter {
       blocked: false,
       latencyMs: 34,
       leakedIpMasked: "203.0.*.*",
+      leakedIpHash: sessionSalt ? hashIpForComparison("203.0.113.88", sessionSalt) : undefined,
       leakedCountry: "CN",
     };
   }

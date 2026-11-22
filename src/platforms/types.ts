@@ -4,12 +4,16 @@ import type {
   DomainTarget,
   FirewallAudit,
   ProxyStaticAudit,
+  ProxyTopologyPreference,
   PublicExitSnapshot,
+  ResolvedProxyTopology,
 } from "../types/report.js";
 
 export interface NetworkStackSnapshot {
   activeUtunInterfaces: string[];
   defaultRouteInterface: string;
+  defaultGatewayIp?: string;
+  defaultGatewayMasked?: string;
   dnsServers: string[];
   dnsServersMasked: string[];
   tailscaleMagicDns: boolean;
@@ -52,6 +56,7 @@ export interface KillSwitchProbeSnapshot {
   blocked: boolean;
   latencyMs: number;
   leakedIpMasked?: string;
+  leakedIpHash?: string;
   leakedCountry?: string;
 }
 
@@ -59,6 +64,9 @@ export interface AuditOptions {
   deepProbe?: boolean;
   sessionSalt: string;
   skipProxyFileRead?: boolean;
+  topologyPreference?: ProxyTopologyPreference;
+  resolvedTopology?: ResolvedProxyTopology;
+  nonGfwMatchesPrimary?: boolean;
 }
 
 export interface PlatformAdapter {
@@ -69,6 +77,8 @@ export interface PlatformAdapter {
     options: AuditOptions
   ): Promise<{
     primaryExit?: PublicExitSnapshot;
+    nonGfwExit?: PublicExitSnapshot;
+    nonGfwExitIpHash?: string;
     systemProxyExit?: PublicExitSnapshot;
     ipv6Exit?: PublicExitSnapshot;
     cliExitIpHash?: string;
@@ -88,5 +98,5 @@ export interface PlatformAdapter {
     netSnap: NetworkStackSnapshot,
     proxyAudit?: ProxyStaticAudit
   ): Promise<EnvironmentHygieneSnapshot>;
-  runKillSwitchProbe(): Promise<KillSwitchProbeSnapshot>;
+  runKillSwitchProbe(sessionSalt?: string): Promise<KillSwitchProbeSnapshot>;
 }

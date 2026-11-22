@@ -10,6 +10,7 @@ export const CLIENT_SCRIPT = String.raw`
     domainFilter: "all",
     liveTunActive: null,
     syncProbing: false,
+    modeSwitching: false,
     drillLoading: false,
     restoreLoading: false,
     posterRatio: "16:9"
@@ -38,6 +39,12 @@ export const CLIENT_SCRIPT = String.raw`
       oauthSync: "浏览器 vs 桌面端 OAuth",
       webrtcStatus: "浏览器 WebRTC UDP",
       tunAdapter: "活跃虚拟网卡 (TUN)",
+      routerGwAdapter: "透明网关 / 路由接口",
+      modeHostTun: "模式: 本机 TUN",
+      modeRouterGw: "模式: 软路由网关",
+      modeSwitchingText: "切换重评中...",
+      step2RouterTitle: "在软路由后台暂停代理服务",
+      step2RouterDesc: "临时停用 OpenClash / PassWall 3 秒后点击下方测试路由器防火墙是否防直连漏出。",
       timezoneLabel: "本机系统时区",
       syncMatched: "100% 同源一致 ✓",
       syncMismatch: "双 IP 横跳高危 ✕",
@@ -100,7 +107,9 @@ export const CLIENT_SCRIPT = String.raw`
       toastRestoreOk: "绿灯复检通过！TUN 与安全海外出口已恢复，可以放心使用 Claude。",
       toastRestoreFail: "尚未检测到 TUN 与受支持海外出口恢复，请确认代理已开启并连接成功！",
       toastSyncRetryOk: "已完成浏览器出口复检！",
-      toastSyncRetryBlocked: "浏览器仍拦截跨域回显请求，请检查 Brave Shields / 去广告扩展或浏览器代理插件。"
+      toastSyncRetryBlocked: "浏览器仍拦截跨域回显请求，请检查 Brave Shields / 去广告扩展或浏览器代理插件。",
+      toastModeRouter: "已切换至「软路由 / 透明网关」检测标准并完成重评",
+      toastModeHost: "已切换至「本机 TUN 虚拟网卡」检测标准并完成重评"
     },
     en: {
       eyebrow: "100% Read-Only Local Audit · Zero Credential Access · Zero System Modification",
@@ -124,6 +133,12 @@ export const CLIENT_SCRIPT = String.raw`
       oauthSync: "Browser vs CLI OAuth Sync",
       webrtcStatus: "Browser WebRTC UDP",
       tunAdapter: "Active Virtual TUN",
+      routerGwAdapter: "Router Gateway",
+      modeHostTun: "Mode: Host TUN",
+      modeRouterGw: "Mode: Router GW",
+      modeSwitchingText: "Re-evaluating...",
+      step2RouterTitle: "Pause Proxy on Router",
+      step2RouterDesc: "Stop OpenClash/PassWall on router for 3s, then test if router firewall blocks WAN leak.",
       timezoneLabel: "Host OS Timezone",
       syncMatched: "100% Identical Exit ✓",
       syncMismatch: "Dual-IP Hop Detected ✕",
@@ -186,7 +201,9 @@ export const CLIENT_SCRIPT = String.raw`
       toastRestoreOk: "Verified! TUN and safe overseas exit are back online.",
       toastRestoreFail: "TUN or safe overseas exit is not yet active. Check your proxy client!",
       toastSyncRetryOk: "Browser OAuth exit check updated!",
-      toastSyncRetryBlocked: "Echo requests still blocked by browser shield/ad-blocker or broken proxy plugin."
+      toastSyncRetryBlocked: "Echo requests still blocked by browser shield/ad-blocker or broken proxy plugin.",
+      toastModeRouter: "Switched to Router / Transparent Gateway evaluation mode",
+      toastModeHost: "Switched to Host TUN evaluation mode"
     }
   };
 
@@ -248,10 +265,22 @@ export const CLIENT_SCRIPT = String.raw`
       banner.classList.remove("visible");
     }
 
+    var isRouterMode = r.resolvedTopology === "router-gateway";
+
     // Navbar controls
     document.getElementById("navEyebrow").textContent = r.demoMode
       ? "DEMO (" + r.demoMode.toUpperCase() + ") · " + t("eyebrow")
       : t("eyebrow");
+    var modeBtnEl = document.getElementById("modeBtn");
+    if (modeBtnEl) {
+      modeBtnEl.textContent = state.modeSwitching
+        ? t("modeSwitchingText")
+        : isRouterMode
+          ? t("modeRouterGw")
+          : t("modeHostTun");
+      modeBtnEl.style.borderColor = isRouterMode ? "rgba(16, 185, 129, 0.45)" : "";
+      modeBtnEl.style.cursor = state.token ? "pointer" : "default";
+    }
     document.getElementById("maskBtnLabel").textContent = state.masked
       ? t("privacyLocked")
       : t("privacyUnlocked");
@@ -345,29 +374,43 @@ export const CLIENT_SCRIPT = String.raw`
     }
 
     var tunList = r.environmentSummary.activeUtunInterfaces;
-    var tunHtml =
-      tunList && tunList.length > 0
+    var gwRouteText =
+      (r.environmentSummary.defaultRouteInterface || "en0") +
+      " → " +
+      (r.environmentSummary.defaultGatewayMasked || "LAN GW");
+    var tunHtml = isRouterMode
+      ? '<span class="status-badge st-pass tabular">' + esc(gwRouteText) + "</span>"
+      : tunList && tunList.length > 0
         ? '<span class="status-badge st-pass tabular">' + esc(tunList.join(", ")) + "</span>"
         : '<span class="status-badge st-crit">OFF (裸奔风险)</span>';
 
     var tzClass = r.environmentSummary.isMainlandTimezone ? "st-warn" : "st-pass";
     var passCount = r.domainMatrix.filter(function (d) { return d.status === "pass"; }).length;
-    var fwLockedAll = r.firewallAudit.claudeAppFullyLocked && r.firewallAudit.claudeCliLocked;
+    var fwLockedAll =
+      (r.firewallAudit.claudeAppFullyLocked && r.firewallAudit.claudeCliLocked) ||
+      (isRouterMode && r.killSwitchVerifiedBadge);
     var nonRawTotal = r.domainMatrix.filter(function (d) { return d.category !== "raw_ip"; }).length;
     var fakeIpCount = r.domainMatrix.filter(function (d) { return d.isFakeIp; }).length;
+    var secondCardHtml =
+      isRouterMode && fakeIpCount === 0
+        ? '<div class="posture-mini-card">' +
+            '<span class="posture-mini-k">' + (state.lang === "zh" ? "非 GFW 源同源" : "NON-GFW SYNC") + "</span>" +
+            '<span class="posture-mini-v tabular" style="color:' + (r.nonGfwMatchesPrimary === false ? "var(--crit)" : "var(--pass)") + '">' + (r.nonGfwMatchesPrimary === false ? "LEAK ✕" : "SYNCED ✓") + "</span>" +
+          "</div>"
+        : '<div class="posture-mini-card">' +
+            '<span class="posture-mini-k">' + (state.lang === "zh" ? "Fake-IP 劫持" : "FAKE-IP DNS") + "</span>" +
+            '<span class="posture-mini-v tabular" style="color:' + (fakeIpCount === nonRawTotal && nonRawTotal > 0 ? "var(--pass)" : "var(--warn)") + '">' + (fakeIpCount === nonRawTotal && nonRawTotal > 0 ? "ACTIVE ✓" : fakeIpCount + "/" + nonRawTotal) + "</span>" +
+          "</div>";
 
     document.getElementById("postureMiniGrid").innerHTML =
       '<div class="posture-mini-card">' +
         '<span class="posture-mini-k">' + (state.lang === "zh" ? "暗桩矩阵同源" : "STEALTH MATRIX") + "</span>" +
         '<span class="posture-mini-v tabular" style="color:' + (passCount === r.domainMatrix.length ? "var(--pass)" : "var(--crit)") + '">' + passCount + " / " + r.domainMatrix.length + " PASS</span>" +
       "</div>" +
+      secondCardHtml +
       '<div class="posture-mini-card">' +
-        '<span class="posture-mini-k">' + (state.lang === "zh" ? "Fake-IP 劫持" : "FAKE-IP DNS") + "</span>" +
-        '<span class="posture-mini-v tabular" style="color:' + (fakeIpCount === nonRawTotal && nonRawTotal > 0 ? "var(--pass)" : "var(--warn)") + '">' + (fakeIpCount === nonRawTotal && nonRawTotal > 0 ? "ACTIVE ✓" : fakeIpCount + "/" + nonRawTotal) + "</span>" +
-      "</div>" +
-      '<div class="posture-mini-card">' +
-        '<span class="posture-mini-k">' + (state.lang === "zh" ? "防火墙焊死" : "APP FIREWALL") + "</span>" +
-        '<span class="posture-mini-v tabular" style="color:' + (fwLockedAll ? "var(--pass)" : "var(--warn)") + '">' + (fwLockedAll ? "LuLu LOCKED ✓" : (state.lang === "zh" ? "未全量锁定" : "UNLOCKED")) + "</span>" +
+        '<span class="posture-mini-k">' + (isRouterMode ? (state.lang === "zh" ? "断网防漏兜底" : "KILL-SWITCH") : (state.lang === "zh" ? "防火墙焊死" : "APP FIREWALL")) + "</span>" +
+        '<span class="posture-mini-v tabular" style="color:' + (fwLockedAll ? "var(--pass)" : "var(--warn)") + '">' + (fwLockedAll ? "LOCKED ✓" : (state.lang === "zh" ? "待验证" : "UNVERIFIED")) + "</span>" +
       "</div>" +
       '<div class="posture-mini-card">' +
         '<span class="posture-mini-k">' + (state.lang === "zh" ? "官方零发包保护" : "ANTHROPIC PROBE") + "</span>" +
@@ -378,7 +421,7 @@ export const CLIENT_SCRIPT = String.raw`
       '<div class="kv-row"><span class="kv-label">' + esc(t("primaryExit")) + '</span><span class="kv-val tabular">' + esc(exitText) + "</span></div>" +
       '<div class="kv-row"><span class="kv-label">' + esc(t("oauthSync")) + '</span><span class="kv-val">' + syncBadgeHtml + "</span></div>" +
       '<div class="kv-row"><span class="kv-label">' + esc(t("webrtcStatus")) + '</span><span class="kv-val">' + webrtcHtml + "</span></div>" +
-      '<div class="kv-row"><span class="kv-label">' + esc(t("tunAdapter")) + '</span><span class="kv-val">' + tunHtml + "</span></div>" +
+      '<div class="kv-row"><span class="kv-label">' + esc(isRouterMode ? t("routerGwAdapter") : t("tunAdapter")) + '</span><span class="kv-val">' + tunHtml + "</span></div>" +
       '<div class="kv-row"><span class="kv-label">' + esc(t("timezoneLabel")) + '</span><span class="kv-val"><span class="status-badge ' + tzClass + ' tabular">' + esc(r.environmentSummary.systemTimezone) + "</span></span></div>";
 
     var retrySyncBtn = document.getElementById("retrySyncBtn");
@@ -407,10 +450,10 @@ export const CLIENT_SCRIPT = String.raw`
         '<span class="step-title">' + esc(t("step1Title")) + "</span>" +
         '<span class="step-desc">' + esc(t("step1Desc")) + "</span>" +
       "</div>" +
-      '<div class="drill-step-card ' + (!tunCurrentlyOn || drill.executed ? "done" : "active") + '">' +
+      '<div class="drill-step-card ' + ((!isRouterMode && !tunCurrentlyOn) || drill.executed ? "done" : "active") + '">' +
         '<span class="step-num tabular">' + esc(t("step2Num")) + "</span>" +
-        '<span class="step-title">' + esc(t("step2Title")) + "</span>" +
-        '<span class="step-desc">' + esc(tunCurrentlyOn ? t("step2DescOn") : t("step2DescOff")) + "</span>" +
+        '<span class="step-title">' + esc(isRouterMode ? t("step2RouterTitle") : t("step2Title")) + "</span>" +
+        '<span class="step-desc">' + esc(isRouterMode ? t("step2RouterDesc") : (tunCurrentlyOn ? t("step2DescOn") : t("step2DescOff"))) + "</span>" +
       "</div>" +
       '<div class="drill-step-card ' + (drillPassed ? "done" : !tunCurrentlyOn ? "active" : "") + '">' +
         '<span class="step-num tabular">' + esc(t("step3Num")) + "</span>" +
@@ -1164,7 +1207,9 @@ export const CLIENT_SCRIPT = String.raw`
       ctx.fillStyle = fgMuted;
       ctx.font = "600 21px -apple-system, 'PingFang SC', sans-serif";
       ctx.fillText(
-        "TUN: " + (r.environmentSummary.activeUtunInterfaces.join(",") || "OFF") +
+        (r.resolvedTopology === "router-gateway"
+          ? "GW: " + (r.environmentSummary.defaultRouteInterface || "en0") + " (Router)"
+          : "TUN: " + (r.environmentSummary.activeUtunInterfaces.join(",") || "OFF")) +
         "  |  TZ: " + r.environmentSummary.systemTimezone,
         ix + 295,
         py + 225
@@ -1261,7 +1306,31 @@ export const CLIENT_SCRIPT = String.raw`
     ctx.fillText(repoTxt, ix + iw - ctx.measureText(repoTxt).width, fy);
   }
 
+  async function handleToggleTopologyMode() {
+    if (!state.token || state.modeSwitching) return;
+    var nextMode = state.report.resolvedTopology === "router-gateway" ? "host-tun" : "router-gateway";
+    state.modeSwitching = true;
+    renderAll();
+    try {
+      var resp = await fetch("/api/topology-mode?token=" + encodeURIComponent(state.token), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: nextMode })
+      });
+      if (resp.ok) {
+        state.report = await resp.json();
+        showToast(nextMode === "router-gateway" ? t("toastModeRouter") : t("toastModeHost"));
+      }
+    } catch (_e) {}
+    state.modeSwitching = false;
+    renderAll();
+  }
+
   // Bind Topbar & Modal Actions
+  var modeBtnInit = document.getElementById("modeBtn");
+  if (modeBtnInit) {
+    modeBtnInit.onclick = handleToggleTopologyMode;
+  }
   document.getElementById("maskBtn").onclick = function () {
     state.masked = !state.masked;
     renderAll();

@@ -11,12 +11,29 @@ import type {
   ModuleScore,
   ProxyStaticAudit,
   PublicExitSnapshot,
+  ResolvedProxyTopology,
 } from "../types/report.js";
 import type { EnvironmentHygieneSnapshot, NetworkStackSnapshot } from "../platforms/types.js";
 
+const DOMESTIC_PUBLIC_DNS_SET = new Set([
+  "114.114.114.114",
+  "114.114.115.115",
+  "223.5.5.5",
+  "223.6.6.6",
+  "119.29.29.29",
+  "119.28.28.28",
+  "180.76.76.76",
+  "1.2.4.8",
+  "210.2.4.8",
+]);
+
 export interface ScoringInputs {
+  resolvedTopology?: ResolvedProxyTopology;
+  routerAutoDetected?: boolean;
   netSnap: NetworkStackSnapshot;
   primaryExit?: PublicExitSnapshot;
+  nonGfwExit?: PublicExitSnapshot;
+  nonGfwMatchesPrimary?: boolean;
   systemProxyExit?: PublicExitSnapshot;
   ipv6Exit?: PublicExitSnapshot;
   domainMatrix: DomainProbeResult[];
@@ -39,6 +56,7 @@ export interface ScoringOutput {
 }
 
 export function evaluateAuditScores(input: ScoringInputs): ScoringOutput {
+  const isRouterMode = input.resolvedTopology === "router-gateway";
   const redlineReasons: BilingualText[] = [];
   const addRedline = (reason: BilingualText): void => {
     if (!redlineReasons.some((r) => r.zh === reason.zh)) {
@@ -201,6 +219,55 @@ export function evaluateAuditScores(input: ScoringInputs): ScoringOutput {
 
   if (
     input.primaryExit &&
+    input.nonGfwExit &&
+    input.nonGfwMatchesPrimary === false
+  ) {
+    m1Deduct += 25;
+    const leakCc = input.nonGfwExit.countryCode !== "UNKNOWN" ? ` · ${input.nonGfwExit.countryCode}` : "";
+    addRedline({
+      zh: `软路由/网关分流穿帮：被墙源走 ${input.primaryExit.ipMasked} (${input.primaryExit.countryCode})，但未被墙国际源 (AWS) 暴露不同出口 (${input.nonGfwExit.ipMasked}${leakCc})`,
+      en: `Split-routing leak: GFW-blocked target exits via ${input.primaryExit.ipMasked}, while unblocked AWS echo exits via ${input.nonGfwExit.ipMasked}${leakCc}`,
+    });
+    m1Findings.push({
+      id: "router-gfwlist-split-leak",
+      moduleId: "egress_matrix",
+      severity: "critical",
+      pointsDeducted: 25,
+      triggersRedline: true,
+      title: {
+        zh: `抓获 GFWList 绕过漏分流：未被墙国际接口暴露不一致出口 (${input.nonGfwExit.ipMasked}${leakCc})`,
+        en: `GFWList Split-Routing Leak: Unblocked international endpoint exposed mismatched exit (${input.nonGfwExit.ipMasked}${leakCc})`,
+      },
+      detail: {
+        zh: `被墙回显源 (1.1.1.1) 走 ${input.primaryExit.countryCode} (${input.primaryExit.ipMasked})，而未被墙的 AWS 公共回显源却走 ${input.nonGfwExit.ipMasked}。在软路由 GFWList（仅代理被墙域名）模式下，Sentry、Datadog、Statsig、Sift 等未被墙的第三方风控暗桩会直接走家庭宽带裸奔上报！`,
+        en: `Cloudflare 1.1.1.1 routed via ${input.primaryExit.ipMasked}, whereas unblocked AWS checkip routed via ${input.nonGfwExit.ipMasked}. In GFWList-only router setups, unblocked Sentry/Datadog/Statsig telemetry leaks your real ISP IP.`,
+      },
+      remediation: {
+        zh: "在 OpenClash / PassWall / Nikki 中切勿使用纯 GFWList 模式；请改为「绕过中国大陆 IP（大陆白名单）」或将 Anthropic 及全部第三方遥测域名强制绑定同一静态节点。",
+        en: "Switch your router proxy from GFWList-only mode to China-IP-Whitelist (Bypass Mainland CN IPs) or explicitly route all Claude & telemetry domains through your static node.",
+      },
+    });
+  } else if (isRouterMode && input.nonGfwMatchesPrimary === true && input.primaryExit?.isSupportedRegion) {
+    m1Findings.push({
+      id: "router-nongfw-consistent",
+      moduleId: "egress_matrix",
+      severity: "pass",
+      pointsDeducted: 0,
+      triggersRedline: false,
+      title: {
+        zh: `非 GFW 国际源分流实测同源：被墙源与 AWS 未被墙源共享同一出口 (${input.primaryExit.ipMasked})`,
+        en: `Non-GFW Split Check Passed: Blocked & unblocked AWS probes share identical exit (${input.primaryExit.ipMasked})`,
+      },
+      detail: {
+        zh: "已排除软路由「仅代理 GFWList 导致未被墙风控暗桩直连宽带」的高频翻车隐患。",
+        en: "Confirmed your transparent router gateway also proxies unblocked international endpoints rather than GFWList-only.",
+      },
+      remediation: { zh: "保持当前绕过大陆白名单或全局代理策略。", en: "Keep current router rule mode." },
+    });
+  }
+
+  if (
+    input.primaryExit &&
     input.systemProxyExit &&
     input.primaryExit.ipMasked !== input.systemProxyExit.ipMasked
   ) {
@@ -231,12 +298,98 @@ export function evaluateAuditScores(input: ScoringInputs): ScoringOutput {
   }
 
   // =========================================================================
-  // 模块 2：TUN 虚拟网卡、DNS 劫持与双栈防漏 (20 分)
+  // 模块 2：TUN 虚拟网卡 / 透明网关、DNS 劫持与双栈防漏 (20 分)
   // =========================================================================
   const m2Findings: CheckFinding[] = [];
   let m2Deduct = 0;
 
-  if (
+  if (isRouterMode) {
+    const gwDisplay = input.netSnap.defaultGatewayMasked || "LAN Gateway";
+    const modeSourceTag = input.routerAutoDetected
+      ? { zh: "（已自动识别透明网关拓扑）", en: " (Auto-detected transparent gateway)" }
+      : { zh: "（软路由/透明网关模式）", en: " (Router gateway mode)" };
+    m2Findings.push({
+      id: "router-gateway-active",
+      moduleId: "network_stack",
+      severity: "pass",
+      pointsDeducted: 0,
+      triggersRedline: false,
+      title: {
+        zh: `局域网透明网关接管中：${input.netSnap.defaultRouteInterface || "en0"} -> ${gwDisplay}${modeSourceTag.zh}`,
+        en: `LAN Transparent Gateway Active: ${input.netSnap.defaultRouteInterface || "en0"} -> ${gwDisplay}${modeSourceTag.en}`,
+      },
+      detail: {
+        zh: "代理部署于上游软路由/旁路由，本机无需开启 utun 虚拟网卡，命令行与桌面端子进程天然经默认网关转发。",
+        en: "Proxy runs on upstream LAN router/gateway; CLI and child processes naturally route via default gateway without local utun.",
+      },
+      remediation: {
+        zh: "若你实际并未使用软路由，可点击页面顶部切换回「本机 TUN 模式」。",
+        en: "If you are not using a router proxy, toggle back to Host TUN mode in the top bar.",
+      },
+    });
+
+    // 软路由 DNS 卫生检查 1：检查是否混入 114 / 223.5.5.5 等国内公共 DNS
+    const hitDomesticDns = input.netSnap.dnsServers.filter((ip) => DOMESTIC_PUBLIC_DNS_SET.has(ip));
+    if (hitDomesticDns.length > 0) {
+      m2Deduct += 8;
+      m2Findings.push({
+        id: "router-domestic-dns-leak",
+        moduleId: "network_stack",
+        severity: "warn",
+        pointsDeducted: 8,
+        triggersRedline: false,
+        title: {
+          zh: `系统 DNS 包含国内公共 DNS (${hitDomesticDns.join(", ")})，存在解析抢答与泄漏风险`,
+          en: `System DNS includes domestic public resolver(s) (${hitDomesticDns.join(", ")})`,
+        },
+        detail: {
+          zh: "在软路由/旁路由环境下，若本机直接配置了 114/阿里/腾讯公共 DNS，DNS 请求可能绕过软路由 Fake-IP/防污染模块或向运营商暴露域名轨迹。",
+          en: "Configuring domestic public DNS directly on the host can bypass your router's Fake-IP/anti-poisoning DNS engine.",
+        },
+        remediation: {
+          zh: "将本机与 DHCP 下发的 DNS 唯一指向软路由/旁路由网关地址，由软路由统一做防污染与 Fake-IP 解析。",
+          en: "Point host/DHCP DNS exclusively to your OpenWrt/gateway IP so all queries go through the router's DNS engine.",
+        },
+      });
+    }
+
+    // 软路由 DNS 卫生检查 2：旁路由网关 (.2 等非 .1 地址) 与主路由 DNS (.1) 错位检查
+    const gwIp = input.netSnap.defaultGatewayIp;
+    const anyFakeIpDomain = input.domainMatrix.some((d) => d.isFakeIp);
+    if (gwIp && /^(\d+\.\d+\.\d+)\.(\d+)$/.test(gwIp)) {
+      const m = /^(\d+\.\d+\.\d+)\.(\d+)$/.exec(gwIp)!;
+      const subnetPrefix = m[1];
+      const lastOctet = m[2];
+      const mainRouterCandidate = `${subnetPrefix}.1`;
+      if (
+        lastOctet !== "1" &&
+        input.netSnap.dnsServers.includes(mainRouterCandidate) &&
+        !input.netSnap.dnsServers.includes(gwIp) &&
+        !anyFakeIpDomain
+      ) {
+        m2Deduct += 6;
+        m2Findings.push({
+          id: "side-router-dns-mismatch",
+          moduleId: "network_stack",
+          severity: "warn",
+          pointsDeducted: 6,
+          triggersRedline: false,
+          title: {
+            zh: "旁路由网关与首选 DNS 错位（网关指向旁路由，但 DNS 仍指向主路由 .1）",
+            en: "Side-router gateway/DNS mismatch (Gateway is side-router, but DNS points to .1 main router)",
+          },
+          detail: {
+            zh: "经典旁路由翻车点：默认网关虽指向旁路由，但 DHCP/手动 DNS 仍留在主路由（光猫/硬路由），会导致国内 DNS 抢答或旁路由无法按域名准确分流。",
+            en: "When using a side-router gateway while DNS remains on the main ISP router (.1), DNS queries leak to ISP resolvers before hitting the side-router.",
+          },
+          remediation: {
+            zh: "在旁路由 DHCP 或本机网络设置中，将「DNS 服务器」也同步改为旁路由的局域网 IP。",
+            en: "Set your DNS server IP to match your side-router gateway IP in DHCP or macOS Wi-Fi settings.",
+          },
+        });
+      }
+    }
+  } else if (
     input.netSnap.activeUtunInterfaces.length === 0 ||
     !input.netSnap.defaultRouteInterface.startsWith("utun")
   ) {
@@ -257,12 +410,12 @@ export function evaluateAuditScores(input: ScoringInputs): ScoringOutput {
           en: "Fatal Blindspot: TUN virtual network interface is not active",
         },
         detail: {
-          zh: `当前系统默认路由走物理接口 ${input.netSnap.defaultRouteInterface || "en0"}。终端命令行工具（如 Claude Code）及后台辅助进程默认忽略系统 HTTP 代理，极易直接裸奔暴露宽带 IP。`,
-          en: "Terminal tools like Claude Code and helper binaries ignore macOS/Windows system HTTP proxies by default, leaking real ISP IP without TUN.",
+          zh: `当前系统默认路由走物理接口 ${input.netSnap.defaultRouteInterface || "en0"}。终端命令行工具（如 Claude Code）及后台辅助进程默认忽略系统 HTTP 代理，极易直接裸奔暴露宽带 IP。（注：若代理部署在软路由，请切换为软路由模式或加 --router 参数）`,
+          en: "Terminal tools like Claude Code and helper binaries ignore system HTTP proxies by default, leaking real ISP IP without TUN. (Use --router if your proxy runs on your LAN router.)",
         },
         remediation: {
-          zh: "在 Clash Verge / Mihomo / Surge / Sing-box 中安装服务模式并开启 TUN（虚拟网卡）与严格路由（strict-route）。",
-          en: "Enable Service Mode + TUN Mode + Strict Route in your proxy client.",
+          zh: "在 Clash Verge / Mihomo / Surge / Sing-box 中开启服务模式与 TUN 严格路由；若使用透明软路由，请点击顶部「模式: 软路由网关」重评。",
+          en: "Enable Service Mode + TUN Mode + Strict Route in your proxy client, or switch to Router Gateway mode if using OpenWrt.",
         },
       });
     }
@@ -745,7 +898,50 @@ export function evaluateAuditScores(input: ScoringInputs): ScoringOutput {
   );
   const installedCount = actionableBins.length;
   const unprotectedBins = actionableBins.filter((b) => !b.firewallCovered);
-  if (installedCount > 0 && unprotectedBins.length > 0 && !input.firewallAudit.littleSnitchDetected) {
+  const routerGlobalKillVerified =
+    isRouterMode &&
+    input.killSwitchDrill.executed &&
+    input.killSwitchDrill.verdict === "global_blocked";
+
+  if (routerGlobalKillVerified) {
+    m4Findings.push({
+      id: "router-killswitch-verified",
+      moduleId: "app_footprint",
+      severity: "pass",
+      pointsDeducted: 0,
+      triggersRedline: false,
+      title: {
+        zh: "软路由级断网阻断 (Kill-Switch) 已实测通过",
+        en: "Router-level WAN forwarding Kill-Switch verified via live drill",
+      },
+      detail: {
+        zh: "实测表明当上游透明代理暂停时，路由器防火墙已阻断 LAN -> WAN 直连回退，不会漏出家庭宽带 IP。",
+        en: "Verified that stopping the router proxy blocks LAN-to-WAN fallback rather than leaking ISP traffic.",
+      },
+      remediation: { zh: "保持路由器防火墙阻断兜底规则。", en: "Keep router firewall kill-switch enabled." },
+    });
+  } else if (isRouterMode && installedCount > 0 && unprotectedBins.length > 0 && !input.firewallAudit.littleSnitchDetected) {
+    m4Deduct += 4;
+    m4Findings.push({
+      id: "router-killswitch-unverified",
+      moduleId: "app_footprint",
+      severity: "warn",
+      pointsDeducted: 4,
+      triggersRedline: false,
+      title: {
+        zh: "软路由插件崩溃/掉线时的防直连兜底 (Kill-Switch) 尚未验证",
+        en: "Router proxy crash fallback (Kill-Switch) is not yet verified",
+      },
+      detail: {
+        zh: "软路由 OpenClash / PassWall 更新重启或核心崩溃期间，默认网关往往会自动回退到主路由宽带直连。本机当前未开启 LuLu 锁定，需确认路由器侧已配置断代理禁连 WAN 规则。",
+        en: "When OpenClash/PassWall restarts or crashes on a router, LAN traffic often falls back directly to WAN ISP unless blocked by router firewall or host LuLu.",
+      },
+      remediation: {
+        zh: "建议在 OpenWrt 防火墙配置禁止绕过透明代理直连 WAN（并在上方演练舱暂停插件实测解锁 S+），或在本机用 LuLu 仅放行软路由 Fake-IP 网段。",
+        en: "Configure OpenWrt nftables/iptables to block direct LAN->WAN fallback (and verify via the Drill above for S+), or lock Fake-IP CIDR in LuLu.",
+      },
+    });
+  } else if (installedCount > 0 && unprotectedBins.length > 0 && !input.firewallAudit.littleSnitchDetected) {
     const pts = Math.min(10, input.firewallAudit.bootRaceRisk ? 10 : 7);
     m4Deduct += pts;
     m4Findings.push({

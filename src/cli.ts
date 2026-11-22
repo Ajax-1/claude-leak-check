@@ -6,6 +6,7 @@ import { BRAND } from "./config/brand.js";
 import { runFullAudit, stripLocalToggleRawFields } from "./core/engine.js";
 import type { DemoScenario } from "./platforms/mock.js";
 import { startLocalReportServer } from "./server/local-server.js";
+import type { ProxyTopologyPreference } from "./types/report.js";
 import { formatMarkdownReport, formatTerminalSummary } from "./ui/format-terminal.js";
 import { renderReportHtml } from "./ui/render-html.js";
 
@@ -15,6 +16,7 @@ interface CliFlags {
   noOpen: boolean;
   deepProbe: boolean;
   noProxyConfig: boolean;
+  topologyPreference: ProxyTopologyPreference;
   exportPath?: string;
   demo?: DemoScenario;
   lang: "zh" | "en";
@@ -29,6 +31,7 @@ function parseCliArgs(argv: string[]): CliFlags {
     noOpen: false,
     deepProbe: false,
     noProxyConfig: false,
+    topologyPreference: "auto",
     lang: "zh",
     help: false,
     version: false,
@@ -41,6 +44,8 @@ function parseCliArgs(argv: string[]): CliFlags {
     else if (arg === "--no-open") flags.noOpen = true;
     else if (arg === "--deep-probe") flags.deepProbe = true;
     else if (arg === "--no-proxy-config") flags.noProxyConfig = true;
+    else if (arg === "--router" || arg === "--gateway") flags.topologyPreference = "router-gateway";
+    else if (arg === "--host-tun") flags.topologyPreference = "host-tun";
     else if (arg === "--help" || arg === "-h") flags.help = true;
     else if (arg === "--version" || arg === "-v") flags.version = true;
     else if (arg === "--export" && argv[i + 1]) {
@@ -49,10 +54,10 @@ function parseCliArgs(argv: string[]): CliFlags {
       flags.exportPath = arg.slice("--export=".length);
     } else if (arg === "--demo" && argv[i + 1]) {
       const val = argv[++i];
-      if (val === "safe" || val === "leak") flags.demo = val;
+      if (val === "safe" || val === "leak" || val === "router") flags.demo = val;
     } else if (arg.startsWith("--demo=")) {
       const val = arg.slice("--demo=".length);
-      if (val === "safe" || val === "leak") flags.demo = val;
+      if (val === "safe" || val === "leak" || val === "router") flags.demo = val;
     } else if (arg === "--lang" && argv[i + 1]) {
       const val = argv[++i];
       if (val === "en" || val === "zh") flags.lang = val;
@@ -74,13 +79,15 @@ Usage:
   npx ${BRAND.packageName} [options]
 
 Options:
+  --router, --gateway  Evaluate in LAN Router / Transparent Gateway mode (OpenWrt / OpenClash / PassWall)
+  --host-tun           Force Host TUN virtual adapter evaluation mode
   --json               Output redacted JSON diagnostic report and exit (for Agent Skills / CI)
   --markdown, --md     Output redacted Markdown report and exit (for Claude Code / Codex / Cursor)
   --export <path>      Save standalone offline single-file HTML report and exit
   --no-open            Start local interactive report server without auto-opening browser
   --deep-probe         Enable zero-credential edge trace on non-Anthropic third-party domains
   --no-proxy-config    Skip static proxy YAML metadata check (network & OS checks only)
-  --demo <safe|leak>   Launch synthetic demo report without probing local network/configs
+  --demo <safe|leak|router> Launch synthetic demo report without probing local network/configs
   --lang <zh|en>       Set CLI output language (default: zh)
   -v, --version        Show version
   -h, --help           Show this help
@@ -123,6 +130,7 @@ async function main(): Promise<void> {
     demo: flags.demo,
     deepProbe: flags.deepProbe,
     skipProxyFileRead: flags.noProxyConfig,
+    topologyPreference: flags.topologyPreference,
   });
 
   // 纯 JSON 输出模式（强制擦除本地原始切换字段）

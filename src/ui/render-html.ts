@@ -41,6 +41,7 @@ export function renderReportHtml(report: AuditReport, options: RenderHtmlOptions
       </div>
       <span id="navEyebrow" class="eyebrow-pill"></span>
       <div class="nav-actions">
+        <button id="modeBtn" class="chip-btn" type="button"></button>
         <button id="maskBtn" class="chip-btn" type="button">
           <span style="font-family:var(--font-mono)">*</span>
           <span id="maskBtnLabel"></span>

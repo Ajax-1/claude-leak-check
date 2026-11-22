@@ -204,6 +204,10 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
       activeUtunInterfaces.push(defaultRouteInterface);
     }
 
+    const gwMatch = /gateway:\s*(\S+)/.exec(routeOut);
+    const rawGw = gwMatch ? gwMatch[1].trim() : "";
+    const defaultGatewayIp = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(rawGw) ? rawGw : undefined;
+
     const dnsServers: string[] = [];
     const resolver1Block = dnsOut.split(/DNS configuration \(for scoped queries\)/)[0] || dnsOut;
     const nsRegex = /nameserver\[\d+\]\s*:\s*(\S+)/g;
@@ -247,6 +251,8 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
     return {
       activeUtunInterfaces,
       defaultRouteInterface,
+      defaultGatewayIp,
+      defaultGatewayMasked: defaultGatewayIp ? maskIp(defaultGatewayIp) : undefined,
       dnsServers,
       dnsServersMasked: dnsServers.map((ip) =>
         isPrivateOrLoopbackIpv4(ip) || isFakeIpv4(ip) ? maskIp(ip) : maskIp(ip)
@@ -270,6 +276,8 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
     options: AuditOptions
   ): Promise<{
     primaryExit?: PublicExitSnapshot;
+    nonGfwExit?: PublicExitSnapshot;
+    nonGfwExitIpHash?: string;
     systemProxyExit?: PublicExitSnapshot;
     ipv6Exit?: PublicExitSnapshot;
     cliExitIpHash?: string;
@@ -286,6 +294,12 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
     );
 
     const ipinfoPromise = runCurlProbe(["-4", "--noproxy", "*", "https://ipinfo.io/json"], 3.2);
+
+    const shouldProbeNonGfw =
+      netSnap.activeUtunInterfaces.length === 0 || options.topologyPreference === "router-gateway";
+    const awsNonGfwPromise = shouldProbeNonGfw
+      ? runCurlProbe(["-4", "--noproxy", "*", "https://checkip.amazonaws.com"], 2.8)
+      : Promise.resolve(null);
 
     const sysProxyEnabled =
       netSnap.systemProxy.httpEnabled ||
@@ -307,9 +321,10 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
         ? runCurlProbe(["-6", "--noproxy", "*", "https://[2606:4700:4700::1111]/cdn-cgi/trace"], 2.6)
         : Promise.resolve(null);
 
-    const [directTrace, ipinfoRes, sysProxyTrace, ipv6Trace] = await Promise.all([
+    const [directTrace, ipinfoRes, awsNonGfwRes, sysProxyTrace, ipv6Trace] = await Promise.all([
       directTracePromise,
       ipinfoPromise,
+      awsNonGfwPromise,
       sysProxyPromise,
       ipv6Promise,
     ]);
@@ -395,7 +410,41 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
       }
     }
 
-    return { primaryExit, systemProxyExit, ipv6Exit, cliExitIpHash };
+    // 软路由 / 透明网关防 GFWList 漏分流校验：提取未被墙公共源 (AWS checkip / ipinfo) 真实出口并与被墙源 (1.1.1.1) 对比
+    let nonGfwExit: PublicExitSnapshot | undefined;
+    let nonGfwExitIpHash: string | undefined;
+    const awsRawCandidate = awsNonGfwRes?.ok ? awsNonGfwRes.body.trim() : "";
+    const validAwsIp = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(awsRawCandidate) ? awsRawCandidate : undefined;
+    const ipinfoIp = typeof ipinfoJson.ip === "string" && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(ipinfoJson.ip.trim())
+      ? ipinfoJson.ip.trim()
+      : undefined;
+    const nonGfwRawIp = validAwsIp || (traceParsed.ip ? ipinfoIp : undefined);
+
+    if (nonGfwRawIp) {
+      nonGfwExitIpHash = hashIpForComparison(nonGfwRawIp, options.sessionSalt);
+      const sameAsPrimary = Boolean(cliExitIpHash && nonGfwExitIpHash === cliExitIpHash);
+      const inferredCc = (
+        (ipinfoIp === nonGfwRawIp && typeof ipinfoJson.country === "string"
+          ? ipinfoJson.country
+          : sameAsPrimary
+            ? rawPrimaryCountry
+            : "UNKNOWN") || "UNKNOWN"
+      ).toUpperCase();
+      nonGfwExit = {
+        source: validAwsIp ? "aws-checkip" : "ipinfo-direct",
+        ipMasked: maskIp(nonGfwRawIp),
+        ipRawForLocalToggle: nonGfwRawIp,
+        countryCode: inferredCc,
+        countryName: getRegionName(inferredCc),
+        asnType: sameAsPrimary && primaryExit ? primaryExit.asnType : "unknown",
+        isSupportedRegion: !RESTRICTED_REGIONS.has(inferredCc) && inferredCc !== "UNKNOWN",
+        isRestrictedRegion: RESTRICTED_REGIONS.has(inferredCc),
+        viaMode: "non-gfw-echo",
+        latencyMs: awsNonGfwRes?.latencyMs ?? ipinfoRes.latencyMs,
+      };
+    }
+
+    return { primaryExit, nonGfwExit, nonGfwExitIpHash, systemProxyExit, ipv6Exit, cliExitIpHash };
   }
 
   async probeDomainMatrix(
@@ -464,25 +513,41 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
               : "proxy"
           : "unknown";
 
+        const isRouterMode = options.resolvedTopology === "router-gateway";
+        const isPoisonedDnsIp = firstIpv4 === "0.0.0.0" || firstIpv4.startsWith("127.");
+        const effectiveIntercepted = isRouterMode ? Boolean(firstIpv4 && !isPoisonedDnsIp) : isTunRouted;
+        const routeDisplay = isRouterMode ? `${routeInterface || "en0"} (GW)` : routeInterface || "unknown";
+
         let status: "pass" | "warn" | "critical" = "pass";
-        let statusReason = {
-          zh: `经 ${routeInterface || "TUN"} 接管${fakeIp ? " (Fake-IP 命中)" : ""}，与海外主出口同源`,
-          en: `Routed via ${routeInterface || "TUN"}${fakeIp ? " (Fake-IP hijacked)" : ""}, aligned with primary exit`,
-        };
+        let statusReason = isRouterMode
+          ? {
+              zh: `经局域网透明网关 (${routeInterface || "en0"})${fakeIp ? " Fake-IP" : ""} 接管，与海外主出口同源`,
+              en: `Routed via LAN transparent gateway (${routeInterface || "en0"})${fakeIp ? " with Fake-IP" : ""}, aligned with primary exit`,
+            }
+          : {
+              zh: `经 ${routeInterface || "TUN"} 接管${fakeIp ? " (Fake-IP 命中)" : ""}，与海外主出口同源`,
+              en: `Routed via ${routeInterface || "TUN"}${fakeIp ? " (Fake-IP hijacked)" : ""}, aligned with primary exit`,
+            };
 
         if (!firstIpv4) {
           status = "warn";
           statusReason = {
-            zh: "本地 DNS 解析超时或被阻断",
-            en: "Local DNS lookup failed or blocked",
+            zh: isRouterMode ? "上游网关 DNS 解析超时或被阻断" : "本地 DNS 解析超时或被阻断",
+            en: isRouterMode ? "Upstream gateway DNS lookup failed or blocked" : "Local DNS lookup failed or blocked",
           };
-        } else if (!isTunRouted) {
+        } else if (isPoisonedDnsIp) {
+          status = "critical";
+          statusReason = {
+            zh: `命中 DNS 污染保留地址 (${firstIpv4})，疑似国内 DNS 抢答污染`,
+            en: `Resolved to poisoned sinkhole IP (${firstIpv4}); DNS hijacked or polluted`,
+          };
+        } else if (!isRouterMode && !isTunRouted) {
           status = "critical";
           statusReason = {
             zh: `未走虚拟网卡！当前走物理接口 ${routeInterface || "en0"} 直连裸奔`,
             en: `Bypassing TUN! Exiting directly via physical interface ${routeInterface || "en0"}`,
           };
-        } else if (staticRuleDecision === "direct") {
+        } else if (!isRouterMode && staticRuleDecision === "direct") {
           status = "critical";
           statusReason = {
             zh: "虽进入 TUN 网卡，但代理分流规则将其指向了 DIRECT 本地直连",
@@ -494,7 +559,18 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
             zh: `当前出口位于受限地区 (${primaryExit.countryCode})`,
             en: `Current exit is in restricted region (${primaryExit.countryCode})`,
           };
-        } else if (!fakeIp && !isRawIp) {
+        } else if (
+          isRouterMode &&
+          options.nonGfwMatchesPrimary === false &&
+          !target.officialAnthropic &&
+          target.host !== "accounts.google.com"
+        ) {
+          status = "critical";
+          statusReason = {
+            zh: "软路由疑似开启 GFWList 绕过模式：未被墙的第三方风控域名将绕过节点直连暴露真实宽带！",
+            en: "Router appears in GFWList mode: unblocked telemetry/anti-fraud domain bypasses proxy directly!",
+          };
+        } else if (!isRouterMode && !fakeIp && !isRawIp) {
           status = "warn";
           statusReason = {
             zh: `走 ${routeInterface} 路由，但未启用 Fake-IP（实 IP 解析需防范本地 DNS 抢答泄漏）`,
@@ -512,8 +588,8 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
           maskedResolvedIps: resolvedIps.slice(0, 3).map((ip) => maskIp(ip)),
           isFakeIp: fakeIp,
           hasIpv6Resolution,
-          routeInterface: routeInterface || "unknown",
-          isTunRouted,
+          routeInterface: routeDisplay,
+          isTunRouted: effectiveIntercepted,
           staticRuleDecision,
           edgeExitIpMasked: edgeExitIpMasked || primaryExit?.ipMasked,
           edgeCountry: edgeCountry || primaryExit?.countryCode,
@@ -1078,7 +1154,7 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
     };
   }
 
-  async runKillSwitchProbe(): Promise<KillSwitchProbeSnapshot> {
+  async runKillSwitchProbe(sessionSalt?: string): Promise<KillSwitchProbeSnapshot> {
     const netSnap = await this.getNetworkSnapshot();
     const tunActive =
       netSnap.activeUtunInterfaces.length > 0 &&
@@ -1103,6 +1179,7 @@ export class DarwinPlatformAdapter implements PlatformAdapter {
       blocked: false,
       latencyMs: probe.latencyMs,
       leakedIpMasked: parsed.ip ? maskIp(parsed.ip) : undefined,
+      leakedIpHash: parsed.ip && sessionSalt ? hashIpForComparison(parsed.ip, sessionSalt) : undefined,
       leakedCountry: parsed.loc?.toUpperCase(),
     };
   }

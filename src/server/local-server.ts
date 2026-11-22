@@ -1,10 +1,11 @@
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { DOMAIN_MATRIX } from "../core/domains.js";
 import { hashIpForComparison, isPrivateOrLoopbackIpv4, maskIp } from "../core/privacy.js";
 import { evaluateAuditScores } from "../core/scorer.js";
 import { stripLocalToggleRawFields } from "../core/engine.js";
 import type { PlatformAdapter } from "../platforms/types.js";
-import type { AuditReport } from "../types/report.js";
+import type { AuditReport, ResolvedProxyTopology } from "../types/report.js";
 import { renderReportHtml } from "../ui/render-html.js";
 
 export interface LocalServerHandle {
@@ -38,8 +39,12 @@ export async function startLocalReportServer(
 
   const recomputeScores = (): void => {
     const scored = evaluateAuditScores({
+      resolvedTopology: currentReport.resolvedTopology,
+      routerAutoDetected: currentReport.routerAutoDetected,
       netSnap: cachedNetSnap,
       primaryExit: currentReport.primaryExit,
+      nonGfwExit: currentReport.nonGfwExit,
+      nonGfwMatchesPrimary: currentReport.nonGfwMatchesPrimary,
       systemProxyExit: currentReport.systemProxyExit,
       ipv6Exit: currentReport.ipv6Exit,
       domainMatrix: currentReport.domainMatrix,
@@ -194,29 +199,88 @@ export async function startLocalReportServer(
       return;
     }
 
+    if (req.method === "POST" && reqUrl.pathname === "/api/topology-mode") {
+      const body = await readJsonBody(req);
+      const requested: ResolvedProxyTopology =
+        body.mode === "router-gateway" ? "router-gateway" : "host-tun";
+
+      currentReport.topologyPreference = requested;
+      currentReport.resolvedTopology = requested;
+      currentReport.routerAutoDetected = false;
+
+      if (!currentReport.demoMode) {
+        cachedNetSnap = await adapter.getNetworkSnapshot();
+        if (requested === "router-gateway" && !currentReport.nonGfwExit) {
+          const freshExits = await adapter.probePublicExits(cachedNetSnap, {
+            sessionSalt,
+            topologyPreference: requested,
+            resolvedTopology: requested,
+          });
+          currentReport.primaryExit = freshExits.primaryExit ?? currentReport.primaryExit;
+          currentReport.cliExitIpHash = freshExits.cliExitIpHash ?? currentReport.cliExitIpHash;
+          currentReport.nonGfwExit = freshExits.nonGfwExit;
+          currentReport.nonGfwMatchesPrimary =
+            currentReport.cliExitIpHash && freshExits.nonGfwExitIpHash
+              ? currentReport.cliExitIpHash === freshExits.nonGfwExitIpHash
+              : undefined;
+        }
+        currentReport.domainMatrix = await adapter.probeDomainMatrix(
+          DOMAIN_MATRIX,
+          currentReport.proxyAudit,
+          currentReport.primaryExit,
+          {
+            sessionSalt,
+            topologyPreference: requested,
+            resolvedTopology: requested,
+            nonGfwMatchesPrimary: currentReport.nonGfwMatchesPrimary,
+          }
+        );
+      }
+
+      recomputeScores();
+      sendJson(res, 200, currentReport);
+      return;
+    }
+
     if (req.method === "POST" && reqUrl.pathname === "/api/drill") {
       // 演练判定前实时重新扫描本机二进制与 LuLu 防火墙规则状态，确保刚开启或刚导入规则的用户立即获得准确 S+ 判定
       const [probe, freshBinFw] = await Promise.all([
-        adapter.runKillSwitchProbe(),
+        adapter.runKillSwitchProbe(sessionSalt),
         adapter.scanBinariesAndFirewall(),
       ]);
       currentReport.binaries = freshBinFw.binaries;
       currentReport.firewallAudit = freshBinFw.firewall;
 
-      if (probe.tunActive && !currentReport.demoMode) {
+      const isRouterMode = currentReport.resolvedTopology === "router-gateway";
+      const routerProxyStillForwarding =
+        isRouterMode &&
+        !probe.blocked &&
+        Boolean(probe.leakedIpHash && currentReport.cliExitIpHash && probe.leakedIpHash === currentReport.cliExitIpHash);
+
+      if ((!isRouterMode && probe.tunActive && !currentReport.demoMode) || (routerProxyStillForwarding && !currentReport.demoMode)) {
         currentReport.killSwitchDrill = {
           ...currentReport.killSwitchDrill,
           executed: false,
           tunActiveDuringDrill: true,
           verdict: "proxy_still_on",
-          verdictTitle: {
-            zh: "检测到 TUN 虚拟网卡仍在运行中，请先手动关闭代理再测！",
-            en: "TUN virtual adapter is still active! Please disable TUN or quit proxy first.",
-          },
-          verdictDetail: {
-            zh: "本工具遵守 100% 只读承诺，不会越权关停你的代理软件。请手动关掉 Clash TUN 开关（或退出代理软件）3 秒后再点此按钮。",
-            en: "We never modify or stop your proxy automatically. Toggle TUN off manually for 3 seconds, then click test again.",
-          },
+          verdictTitle: isRouterMode
+            ? {
+                zh: "检测到上游软路由代理仍在转发（出口仍为原海外节点），请先在路由器后台暂停代理再测！",
+                en: "Upstream router proxy is still forwarding! Pause OpenClash/PassWall on your router first.",
+              }
+            : {
+                zh: "检测到 TUN 虚拟网卡仍在运行中，请先手动关闭代理再测！",
+                en: "TUN virtual adapter is still active! Please disable TUN or quit proxy first.",
+              },
+          verdictDetail: isRouterMode
+            ? {
+                zh: "请登录软路由后台临时停用 OpenClash / PassWall / Nikki 服务 3 秒，再点击此按钮实测路由器防火墙是否会阻断宽带直连回退。",
+                en: "Temporarily stop OpenClash/PassWall on your router for 3 seconds, then click test to verify router LAN->WAN kill-switch.",
+              }
+            : {
+                zh: "本工具遵守 100% 只读承诺，不会越权关停你的代理软件。请手动关掉 Clash TUN 开关（或退出代理软件）3 秒后再点此按钮。",
+                en: "We never modify or stop your proxy automatically. Toggle TUN off manually for 3 seconds, then click test again.",
+              },
         };
         sendJson(res, 200, currentReport);
         return;
@@ -302,14 +366,27 @@ export async function startLocalReportServer(
       }
 
       cachedNetSnap = await adapter.getNetworkSnapshot();
-      const exits = await adapter.probePublicExits(cachedNetSnap, { sessionSalt });
-      const restoredOk =
-        cachedNetSnap.activeUtunInterfaces.length > 0 &&
-        Boolean(exits.primaryExit?.isSupportedRegion);
+      const isRouterMode = currentReport.resolvedTopology === "router-gateway";
+      const exits = await adapter.probePublicExits(cachedNetSnap, {
+        sessionSalt,
+        topologyPreference: currentReport.topologyPreference,
+        resolvedTopology: currentReport.resolvedTopology,
+      });
+      const restoredOk = isRouterMode
+        ? Boolean(exits.primaryExit?.isSupportedRegion) &&
+          (exits.nonGfwExitIpHash && exits.cliExitIpHash ? exits.nonGfwExitIpHash === exits.cliExitIpHash : true)
+        : cachedNetSnap.activeUtunInterfaces.length > 0 && Boolean(exits.primaryExit?.isSupportedRegion);
 
       if (restoredOk) {
         currentReport.primaryExit = exits.primaryExit;
         currentReport.cliExitIpHash = exits.cliExitIpHash;
+        if (exits.nonGfwExit) {
+          currentReport.nonGfwExit = exits.nonGfwExit;
+          currentReport.nonGfwMatchesPrimary =
+            exits.cliExitIpHash && exits.nonGfwExitIpHash
+              ? exits.cliExitIpHash === exits.nonGfwExitIpHash
+              : undefined;
+        }
         if (currentReport.browserSync.browserExitIpHash && exits.cliExitIpHash) {
           currentReport.browserSync.matchesCliExit =
             currentReport.browserSync.browserExitIpHash === exits.cliExitIpHash;
