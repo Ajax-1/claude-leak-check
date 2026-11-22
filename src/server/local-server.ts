@@ -172,10 +172,12 @@ export async function startLocalReportServer(
       }
 
       currentReport.browserSync = {
-        completed: Boolean(rawBrowserIp) || Boolean(body.webrtcTested),
+        completed: true,
+        probeBlockedOrFailed: !rawBrowserIp,
+        probeSource: typeof body.probeSource === "string" ? body.probeSource.trim().slice(0, 40) : undefined,
         browserExitIpMasked: rawBrowserIp ? maskIp(rawBrowserIp) : undefined,
         browserExitIpHash,
-        browserCountryCode: browserCountry,
+        browserCountryCode: browserCountry || undefined,
         matchesCliExit,
         webrtcTested: Boolean(body.webrtcTested),
         webrtcPublicIpsMasked: publicWebrtcIps,
@@ -307,6 +309,11 @@ export async function startLocalReportServer(
 
       if (restoredOk) {
         currentReport.primaryExit = exits.primaryExit;
+        currentReport.cliExitIpHash = exits.cliExitIpHash;
+        if (currentReport.browserSync.browserExitIpHash && exits.cliExitIpHash) {
+          currentReport.browserSync.matchesCliExit =
+            currentReport.browserSync.browserExitIpHash === exits.cliExitIpHash;
+        }
         currentReport.killSwitchDrill.proxyRestoredVerified = true;
         cachedEnvSnap = await adapter.inspectEnvironmentHygiene(cachedNetSnap, currentReport.proxyAudit);
         recomputeScores();

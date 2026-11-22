@@ -151,6 +151,8 @@ export interface ModuleScore {
 
 export interface BrowserRealtimeSync {
   completed: boolean;
+  probeBlockedOrFailed?: boolean;
+  probeSource?: string;
   browserExitIpMasked?: string;
   browserExitIpHash?: string;
   browserCountryCode?: string;

@@ -1,6 +1,6 @@
 {
   "name": "claude-leak-check",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Local read-only IP leak, split-routing, and firewall diagnostic tool for Claude Desktop and Claude Code.",
   "keywords": [
     "claude",

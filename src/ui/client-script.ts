@@ -9,6 +9,7 @@ export const CLIENT_SCRIPT = String.raw`
     masked: true,
     domainFilter: "all",
     liveTunActive: null,
+    syncProbing: false,
     drillLoading: false,
     restoreLoading: false,
     posterRatio: "16:9"
@@ -42,6 +43,9 @@ export const CLIENT_SCRIPT = String.raw`
       syncMismatch: "双 IP 横跳高危 ✕",
       syncChecking: "正在本地比对...",
       syncStaticOnly: "静态模式",
+      syncBlockedRetry: "回显被拦截 · 点此重试 ↻",
+      syncBlockedStatic: "回显被浏览器拦截",
+      syncCliOffline: "浏览器 {IP} (CLI 离线)",
       webrtcClean: "0 公网泄漏 ✓",
       webrtcLeak: "暴露公网 IP ✕",
       drillTitle: "离线交互式「断网防漏演练」",
@@ -94,7 +98,9 @@ export const CLIENT_SCRIPT = String.raw`
       toastCopiedImg: "已将高清脱敏海报复制到剪贴板！可直接粘贴发送",
       toastCopiedText: "已复制分享配文到剪贴板！",
       toastRestoreOk: "绿灯复检通过！TUN 与安全海外出口已恢复，可以放心使用 Claude。",
-      toastRestoreFail: "尚未检测到 TUN 与受支持海外出口恢复，请确认代理已开启并连接成功！"
+      toastRestoreFail: "尚未检测到 TUN 与受支持海外出口恢复，请确认代理已开启并连接成功！",
+      toastSyncRetryOk: "已完成浏览器出口复检！",
+      toastSyncRetryBlocked: "浏览器仍拦截跨域回显请求，请检查 Brave Shields / 去广告扩展或浏览器代理插件。"
     },
     en: {
       eyebrow: "100% Read-Only Local Audit · Zero Credential Access · Zero System Modification",
@@ -123,6 +129,9 @@ export const CLIENT_SCRIPT = String.raw`
       syncMismatch: "Dual-IP Hop Detected ✕",
       syncChecking: "Comparing locally...",
       syncStaticOnly: "Static Snapshot",
+      syncBlockedRetry: "Echo Blocked · Retry ↻",
+      syncBlockedStatic: "Blocked by Browser Shield",
+      syncCliOffline: "Browser {IP} (CLI Offline)",
       webrtcClean: "0 Public Leak ✓",
       webrtcLeak: "Public IP Leaked ✕",
       drillTitle: "Interactive Offline Kill-Switch Drill",
@@ -175,7 +184,9 @@ export const CLIENT_SCRIPT = String.raw`
       toastCopiedImg: "Copied Retina PNG card to clipboard!",
       toastCopiedText: "Copied share caption to clipboard!",
       toastRestoreOk: "Verified! TUN and safe overseas exit are back online.",
-      toastRestoreFail: "TUN or safe overseas exit is not yet active. Check your proxy client!"
+      toastRestoreFail: "TUN or safe overseas exit is not yet active. Check your proxy client!",
+      toastSyncRetryOk: "Browser OAuth exit check updated!",
+      toastSyncRetryBlocked: "Echo requests still blocked by browser shield/ad-blocker or broken proxy plugin."
     }
   };
 
@@ -298,13 +309,25 @@ export const CLIENT_SCRIPT = String.raw`
       : "Offline / Unreachable";
 
     var syncBadgeHtml = "";
-    if (r.browserSync && r.browserSync.completed) {
+    if (state.syncProbing) {
+      syncBadgeHtml = '<span class="status-badge st-info">' + esc(t("syncChecking")) + "</span>";
+    } else if (r.browserSync && r.browserSync.completed) {
       if (r.browserSync.matchesCliExit === true) {
         syncBadgeHtml = '<span class="status-badge st-pass">' + esc(t("syncMatched")) + "</span>";
       } else if (r.browserSync.matchesCliExit === false) {
         syncBadgeHtml = '<span class="status-badge st-crit">' + esc(t("syncMismatch")) + "</span>";
+      } else if (r.browserSync.browserExitIpMasked) {
+        syncBadgeHtml =
+          '<span class="status-badge st-warn">' +
+          esc(t("syncCliOffline").replace("{IP}", r.browserSync.browserExitIpMasked)) +
+          "</span>";
+      } else if (state.token) {
+        syncBadgeHtml =
+          '<button type="button" id="retrySyncBtn" class="status-badge st-warn" style="cursor:pointer;border:1px solid rgba(245,158,11,0.38);font-family:inherit">' +
+          esc(t("syncBlockedRetry")) +
+          "</button>";
       } else {
-        syncBadgeHtml = '<span class="status-badge st-info">' + esc(r.browserSync.browserExitIpMasked || "—") + "</span>";
+        syncBadgeHtml = '<span class="status-badge st-warn">' + esc(t("syncBlockedStatic")) + "</span>";
       }
     } else if (state.token) {
       syncBadgeHtml = '<span class="status-badge st-info">' + esc(t("syncChecking")) + "</span>";
@@ -357,6 +380,13 @@ export const CLIENT_SCRIPT = String.raw`
       '<div class="kv-row"><span class="kv-label">' + esc(t("webrtcStatus")) + '</span><span class="kv-val">' + webrtcHtml + "</span></div>" +
       '<div class="kv-row"><span class="kv-label">' + esc(t("tunAdapter")) + '</span><span class="kv-val">' + tunHtml + "</span></div>" +
       '<div class="kv-row"><span class="kv-label">' + esc(t("timezoneLabel")) + '</span><span class="kv-val"><span class="status-badge ' + tzClass + ' tabular">' + esc(r.environmentSummary.systemTimezone) + "</span></span></div>";
+
+    var retrySyncBtn = document.getElementById("retrySyncBtn");
+    if (retrySyncBtn) {
+      retrySyncBtn.onclick = function () {
+        runBrowserLiveProbes(true);
+      };
+    }
 
     // Kill-Switch Drill Cabin
     document.getElementById("drillTitle").textContent = t("drillTitle");
@@ -606,36 +636,95 @@ export const CLIENT_SCRIPT = String.raw`
     document.getElementById("btnCloseModal").textContent = t("closeBtn");
   }
 
-  // Live Browser OAuth Sync + WebRTC STUN Probe
-  async function runBrowserLiveProbes() {
-    if (!state.token || state.report.demoMode) return;
+  function isValidIpLiteral(s) {
+    if (!s || typeof s !== "string") return false;
+    var v = s.trim();
+    return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(v) || /^[a-f0-9:]{3,45}$/i.test(v);
+  }
 
-    var browserIp = "";
-    var browserCountry = "";
-
+  async function fetchEchoWithTimeout(url, timeoutMs) {
+    var ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    var timer = ctrl
+      ? setTimeout(function () {
+          try {
+            ctrl.abort();
+          } catch (_e) {}
+        }, timeoutMs)
+      : null;
     try {
-      var res = await fetch("https://www.cloudflare.com/cdn-cgi/trace", { cache: "no-store" });
-      if (res.ok) {
-        var txt = await res.text();
-        txt.split(/\r?\n/).forEach(function (line) {
-          var idx = line.indexOf("=");
-          if (idx > 0) {
-            var k = line.slice(0, idx).trim();
-            var v = line.slice(idx + 1).trim();
-            if (k === "ip") browserIp = v;
-            if (k === "loc") browserCountry = v;
-          }
-        });
-      }
-    } catch (_e) {
-      try {
-        var res2 = await fetch("https://api.ipify.org?format=json", { cache: "no-store" });
-        if (res2.ok) {
-          var j = await res2.json();
-          if (j && j.ip) browserIp = j.ip;
-        }
-      } catch (_e2) {}
+      var opts = { cache: "no-store" };
+      if (ctrl) opts.signal = ctrl.signal;
+      return await fetch(url, opts);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
+  }
+
+  // 顺序轮询多组支持 CORS 的 IPv4 优先公共回显端点（无论前一个源是抛异常、403/520 非 200 还是空响应均自动切下一个源）
+  async function probeBrowserOutboundEcho() {
+    var sources = [
+      { id: "1.1.1.1-trace", url: "https://1.1.1.1/cdn-cgi/trace", kind: "trace" },
+      { id: "1.0.0.1-trace", url: "https://1.0.0.1/cdn-cgi/trace", kind: "trace" },
+      { id: "ipinfo-json", url: "https://ipinfo.io/json", kind: "ipinfo" },
+      { id: "icanhazip-v4", url: "https://ipv4.icanhazip.com", kind: "text" },
+      { id: "ident-v4", url: "https://v4.ident.me", kind: "text" },
+      { id: "cloudflare-trace", url: "https://www.cloudflare.com/cdn-cgi/trace", kind: "trace" }
+    ];
+
+    for (var i = 0; i < sources.length; i++) {
+      var src = sources[i];
+      try {
+        var res = await fetchEchoWithTimeout(src.url, 3200);
+        if (!res || !res.ok) continue;
+
+        if (src.kind === "trace") {
+          var txt = await res.text();
+          var foundIp = "";
+          var foundLoc = "";
+          txt.split(/\r?\n/).forEach(function (line) {
+            var idx = line.indexOf("=");
+            if (idx > 0) {
+              var k = line.slice(0, idx).trim();
+              var v = line.slice(idx + 1).trim();
+              if (k === "ip") foundIp = v;
+              if (k === "loc") foundLoc = v;
+            }
+          });
+          if (isValidIpLiteral(foundIp)) {
+            return { ip: foundIp.trim(), country: foundLoc, source: src.id };
+          }
+        } else if (src.kind === "ipinfo") {
+          var j = await res.json();
+          if (j && isValidIpLiteral(j.ip)) {
+            return {
+              ip: String(j.ip).trim(),
+              country: typeof j.country === "string" ? j.country.trim() : "",
+              source: src.id
+            };
+          }
+        } else {
+          var rawTxt = (await res.text()).trim();
+          if (isValidIpLiteral(rawTxt)) {
+            return { ip: rawTxt, country: "", source: src.id };
+          }
+        }
+      } catch (_e) {
+        // 被隐私扩展拦截或超时，继续尝试下一个回显源
+      }
+    }
+
+    return { ip: "", country: "", source: "" };
+  }
+
+  // Live Browser OAuth Sync + WebRTC STUN Probe
+  async function runBrowserLiveProbes(isManualRetry) {
+    if (!state.token || state.report.demoMode || state.syncProbing) return;
+    state.syncProbing = true;
+    if (isManualRetry) renderAll();
+
+    var echoRes = await probeBrowserOutboundEcho();
+    var browserIp = echoRes.ip;
+    var browserCountry = echoRes.country;
 
     // Native WebRTC STUN candidate check
     var webrtcIps = [];
@@ -686,6 +775,7 @@ export const CLIENT_SCRIPT = String.raw`
         body: JSON.stringify({
           browserIp: browserIp,
           browserCountry: browserCountry,
+          probeSource: echoRes.source,
           webrtcTested: webrtcTested,
           webrtcIps: webrtcIps,
           browserTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -694,9 +784,14 @@ export const CLIENT_SCRIPT = String.raw`
       });
       if (syncResp.ok) {
         state.report = await syncResp.json();
-        renderAll();
       }
     } catch (_e) {}
+
+    state.syncProbing = false;
+    renderAll();
+    if (isManualRetry) {
+      showToast(browserIp ? t("toastSyncRetryOk") : t("toastSyncRetryBlocked"));
+    }
   }
 
   async function handleRunDrill() {
@@ -727,6 +822,7 @@ export const CLIENT_SCRIPT = String.raw`
         if (data.report) state.report = data.report;
         if (data.restoredOk) {
           showToast(t("toastRestoreOk"));
+          runBrowserLiveProbes(false);
         } else {
           showToast(t("toastRestoreFail"));
         }
@@ -920,7 +1016,13 @@ export const CLIENT_SCRIPT = String.raw`
         ],
         [
           state.lang === "zh" ? "浏览器 vs CLI 出口" : "OAuth Dual-End Sync",
-          r.browserSync.matchesCliExit === true ? "SYNCED ✓" : r.browserSync.matchesCliExit === false ? "MISMATCH ✕" : "CHECKED"
+          r.browserSync.matchesCliExit === true
+            ? "SYNCED ✓"
+            : r.browserSync.matchesCliExit === false
+              ? "MISMATCH ✕"
+              : r.browserSync.probeBlockedOrFailed
+                ? "BLOCKED !"
+                : "PENDING"
         ],
         [
           state.lang === "zh" ? "WebRTC UDP 防穿透" : "WebRTC UDP Shield",
@@ -1068,8 +1170,16 @@ export const CLIENT_SCRIPT = String.raw`
         py + 225
       );
       ctx.fillText(
-        "OAuth Sync: " + (r.browserSync.matchesCliExit ? "PASS ✓" : "CHECK") +
-        "  |  WebRTC: " + (r.browserSync.webrtcHasDomesticOrMismatchLeak ? "LEAK ✕" : "PASS ✓"),
+        "OAuth Sync: " +
+          (r.browserSync.matchesCliExit === true
+            ? "PASS ✓"
+            : r.browserSync.matchesCliExit === false
+              ? "MISMATCH ✕"
+              : r.browserSync.probeBlockedOrFailed
+                ? "BLOCKED !"
+                : "PENDING") +
+          "  |  WebRTC: " +
+          (r.browserSync.webrtcHasDomesticOrMismatchLeak ? "LEAK ✕" : "PASS ✓"),
         ix + 295,
         py + 268
       );

@@ -431,6 +431,46 @@ export function evaluateAuditScores(input: ScoringInputs): ScoringOutput {
           en: "Keep browser using system TUN without extra proxy extensions.",
         },
       });
+    } else if (input.browserSync.browserExitIpMasked) {
+      m3Findings.push({
+        id: "browser-cli-uncompared",
+        moduleId: "browser_sync",
+        severity: "warn",
+        pointsDeducted: 0,
+        triggersRedline: false,
+        title: {
+          zh: `已读取浏览器出口 (${input.browserSync.browserExitIpMasked})，但终端底层探针离线未能完成双端比对`,
+          en: `Browser exit detected (${input.browserSync.browserExitIpMasked}), but CLI socket probe was offline`,
+        },
+        detail: {
+          zh: "浏览器可正常出网而终端底层无代理探针失败，通常意味着代理仅在浏览器插件内生效而未开启系统级 TUN。",
+          en: "Browser reached echo endpoints while CLI socket probes failed, suggesting proxy only runs inside browser without TUN.",
+        },
+        remediation: {
+          zh: "请开启代理客户端的 TUN 虚拟网卡模式后重新执行检测。",
+          en: "Enable TUN virtual adapter mode in your proxy client and re-run the check.",
+        },
+      });
+    } else {
+      m3Findings.push({
+        id: "browser-echo-blocked",
+        moduleId: "browser_sync",
+        severity: "info",
+        pointsDeducted: 0,
+        triggersRedline: false,
+        title: {
+          zh: "浏览器跨域回显请求被拦截或不可达（双端同源待确认）",
+          en: "Browser outbound IP echo blocked or unreachable (OAuth sync unverified)",
+        },
+        detail: {
+          zh: `当前浏览器 (${input.envSnap.defaultBrowser}) 对多组公共回显接口的请求均未返回出口 IP。常见原因：(1) Brave Shields、uBlock Origin、AdGuard 等隐私防追踪扩展拦截了 127.0.0.1 页面的跨域回显请求；(2) 浏览器内挂载的独立代理扩展（如 SwitchyOmega）指向了未运行端口导致浏览器断网。`,
+          en: `All fallback IP echo requests from ${input.envSnap.defaultBrowser} were blocked or failed. Common causes: (1) Brave Shields / uBlock Origin / AdGuard blocking cross-origin probes from 127.0.0.1, or (2) a misconfigured browser proxy extension.`,
+        },
+        remediation: {
+          zh: "可对 127.0.0.1 临时关闭防追踪盾后点击首屏「点此重试」按钮；若浏览器本身无法访问外网，请关闭冲突的浏览器代理扩展以统一走 TUN。",
+          en: "Temporarily lower Brave Shields / ad-blocker on 127.0.0.1 and click Retry above, or disable broken browser proxy extensions.",
+        },
+      });
     }
 
     if (input.browserSync.webrtcHasDomesticOrMismatchLeak) {
